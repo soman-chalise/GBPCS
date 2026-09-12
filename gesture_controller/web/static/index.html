@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gesture Controller</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+  <h1>Gesture Controller</h1>
+  <p class="sub">Local control panel &mdash; <span id="mode-pill" class="pill idle">IDLE</span></p>
+
+  <div class="grid">
+    <div>
+      <div class="card">
+        <h2>Live preview</h2>
+        <div class="preview-box"><img id="preview" src="/stream.mjpg" alt="camera preview"></div>
+        <div class="status-row">
+          <span><span class="k">fps</span> <b id="s-fps">-</b></span>
+          <span><span class="dot" id="s-hand-dot"></span><span id="s-hand">no hand</span></span>
+          <span><span class="k">cooldown</span> <b id="s-cooldown">0.0s</b></span>
+        </div>
+        <div class="last-event" id="s-last-event">no events yet</div>
+      </div>
+
+      <div class="card">
+        <h2>Session</h2>
+        <div class="btn-row">
+          <button class="btn primary" id="btn-live">Go LIVE</button>
+          <button class="btn" id="btn-keys">Keystrokes: ON</button>
+          <button class="btn" id="btn-reset">Reset stats</button>
+          <button class="btn" id="btn-reload">Reload config</button>
+        </div>
+        <p class="hint">"Keystrokes ON" actually sends input to the focused window. Turn it
+          off to validate gestures without driving another app.</p>
+      </div>
+    </div>
+
+    <div>
+      <div class="card">
+        <h2>Gestures &amp; bindings</h2>
+        <table>
+          <thead><tr><th>gesture</th><th>type</th><th>samples</th><th>control</th></tr></thead>
+          <tbody id="gesture-rows"></tbody>
+        </table>
+        <p class="hint">* built-in, always available, no recording needed. Everything else
+          is a custom gesture you recorded below.</p>
+      </div>
+
+      <div class="card">
+        <h2>Record a custom gesture</h2>
+        <div class="field">
+          <label>name</label>
+          <input type="text" id="rec-name" placeholder="e.g. wave">
+        </div>
+        <div class="field">
+          <label>type</label>
+          <div class="radio-row">
+            <label><input type="radio" name="rec-type" value="trajectory" checked> trajectory (swipe-like)</label>
+            <label><input type="radio" name="rec-type" value="pose"> pose (hand-shape)</label>
+          </div>
+        </div>
+        <div class="btn-row">
+          <button class="btn primary" id="btn-record">Start recording</button>
+          <button class="btn danger" id="btn-cancel" disabled>Cancel</button>
+        </div>
+        <p class="hint" id="rec-hint"></p>
+      </div>
+
+      <div class="card">
+        <h2>Distance report</h2>
+        <pre class="report" id="report">(no custom gestures recorded yet)</pre>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

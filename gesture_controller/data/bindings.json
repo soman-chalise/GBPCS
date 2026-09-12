@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "saved_at": 1789212152.0163279,
+  "bindings": {
+    "closed_fist_hold": "first_slide",
+    "gun_point": "laser_pointer",
+    "open_palm_hold": "blank_screen",
+    "peace_sign": "end_presentation",
+    "swipe_left": "previous_slide",
+    "swipe_right": "next_slide",
+    "thumbs_up": "start_presentation"
+  }
+}

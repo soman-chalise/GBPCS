@@ -1,0 +1,134 @@
+# ---------------------------------------------------------------------------
+# thresholds.yaml -- EVERY tunable constant lives here (PRD section 6).
+# No magic numbers in core/*.py. If you find one there, it's a bug.
+#
+# Units note: all spatial quantities are in "hand widths" -- distances are
+# divided by hand_scale (wrist -> middle-MCP distance), so nothing here
+# depends on camera resolution or how far you sit from the webcam.
+# ---------------------------------------------------------------------------
+
+camera:
+  # Either a device index (0, 1, 2 ...) or a stream URL in quotes.
+  #   0                                  built-in / first USB webcam
+  #   1                                  a virtual webcam (DroidCam, Iriun, Camo, iVCam)
+  #   "http://192.168.42.129:8080/video" IP Webcam over USB tethering (no driver needed)
+  # Override without editing this file:  app.py --camera 1
+  source: 0
+  width: 1280
+  height: 720
+  fps: 30
+  # Network streams (a phone camera) queue frames faster than we consume them,
+  # so latency grows without bound. With this on, a background thread keeps
+  # only the NEWEST frame and drops the backlog. Ignored for USB devices,
+  # whose read() blocks on hardware and cannot run ahead.
+  threaded_stream: true
+  # Cap how often we PROCESS frames. 0 = uncapped (run as fast as the camera).
+  # Only meaningful together with threaded_stream, which absorbs the surplus;
+  # capping a queued stream without it just builds a backlog.
+  # Override per run with:  app.py --fps 18
+  process_fps_cap: 18
+  flip_horizontal: true        # mirror view, so moving your hand right moves it right on screen
+
+tracker:
+  model_path: models/hand_landmarker.task
+  num_hands: 1                  # PRD 4.1 -- single hand only for v1
+  # Lowered from 0.5 after a real session showed 8/11 segments closing on
+  # hand_lost: the room measured 71/255 brightness and 80 Laplacian sharpness,
+  # so a swiping hand motion-blurs badly. Looser thresholds let the tracker
+  # ride through blurred frames instead of dropping the hand mid-swipe.
+  # Raise back toward 0.5 if you get spurious detections in a bright room.
+  min_hand_detection_confidence: 0.4
+  min_hand_presence_confidence: 0.3
+  min_tracking_confidence: 0.3
+  z_weight: 0.3                 # MediaPipe z is noisy; downweight it in the shape vector
+  shape_smooth_alpha: 0.45      # EMA on the 63-dim shape vector
+  trajectory_smooth_alpha: 0.45 # EMA on the 2D wrist stream -- SEPARATE filter, separate stream
+  clahe_clip_limit: 2.0         # basic lighting normalization (PRD section 3)
+  clahe_tile_grid: 8
+  # ROI auto-cropping is deliberately absent -- see README "Dropped optimizations".
+
+segmenter:
+  # Speed here is ALWAYS ||delta wrist_xy|| / hand_scale, computed from the 2D
+  # wrist stream only. Never from the shape vector. This is the v1 bug fix.
+  idle_speed_threshold: 0.055   # hand-widths per frame; below this counts as "still"
+  motion_start_frames: 2        # consecutive moving frames to confirm a segment started
+  motion_end_still_frames: 6    # consecutive still frames to confirm it ended
+  # Lowered 5 -> 4 to match process_fps_cap: 18. At 18 fps a brisk 0.25 s
+  # swipe yields only ~4-5 frames of actual motion, and segments were already
+  # being dropped as too_short at 30 fps. Preroll frames are prepended on top,
+  # and min_segment_path_length still gates out genuine noise, so this does not
+  # loosen false-positive rejection. Put it back to 5 if you raise the cap.
+  min_segment_frames: 4         # shorter segments are discarded as noise
+  max_segment_frames: 90        # ~3s at 30fps; safety cap
+  preroll_frames: 4             # frames kept from before motion was confirmed
+  min_segment_path_length: 0.55 # total path in hand-widths; kills jitter-sized "segments"
+  hand_lost_grace_frames: 6     # tolerate this many no-hand frames (motion blur) mid-segment
+  # On hand loss beyond the grace window we CLOSE and classify the segment rather
+  # than discard it -- dropping it is exactly the v1 fast-swipe failure.
+
+trajectory:
+  resample_points: 16           # fixed N; resampling is by cumulative path distance
+  net_displacement_weight: 4.0  # PRD 4.3 -- net (end-start) is the dominant swipe signal
+  default_threshold: 0.42       # generic pre-tuned threshold used at 1 sample
+  calibration_k: 2.0            # calibrated threshold = mean(intra) + k * std(intra)
+  threshold_floor: 0.12         # never let a calibrated threshold collapse below this
+  threshold_ceiling: 0.60       # ...or blow past this
+  margin_ratio: 0.80            # best must be <= this * runner-up distance, else ambiguous -> reject
+
+pose:
+  # Feature = per-finger curl ratio: ||tip - MCP|| / hand_scale. 4 dims by default.
+  include_thumb: false          # thumb curl geometry differs; excluded initially (PRD 4.4)
+  default_threshold: 0.30       # generic pre-tuned threshold used at 1 sample
+  calibration_k: 2.5
+  threshold_floor: 0.08
+  threshold_ceiling: 0.45
+  margin_ratio: 0.80
+  hold_frames: 4                # frames a pose must persist before it becomes the "stable" pose
+  suppress_above_speed: 0.20    # ignore pose transitions while the wrist is moving this fast
+                                # (stops a swiping hand's mid-flight shape from firing a pose).
+                                # Reads the speed VALUE only -- not the segmenter state.
+                                # Set very high (e.g. 99) to disable for validation test 3.
+  record_trim_ratio: 0.2        # when recording a pose, drop this fraction off each end
+                                # of the capture and average the stable middle
+
+builtin:
+  # Rule-based gestures that ship pre-tuned and need zero recording (see
+  # core/builtin_gestures.py). Separate from [pose]/[trajectory], which are
+  # the calibrated thresholds for a user's own recorded gestures.
+  finger_extended: 0.85     # curl ratio above this = extended (index/middle/ring/pinky)
+  finger_curled: 0.55       # curl ratio below this = curled
+  thumb_extended: 0.65      # thumb geometry differs from the other four fingers
+  thumb_curled: 0.45
+  thumb_up_y_margin: 0.35   # thumb tip must be this far above the wrist (hand-widths) for thumbs_up
+  gun_point_z_margin: 0.05  # index tip must be this much closer to camera (relative z) for gun_point
+  hold_frames: 5            # frames a built-in pose must be stable before it fires
+  suppress_above_speed: 0.20   # ignore pose transitions while the wrist is moving this fast
+  swipe_min_path_length: 0.55  # total path in hand-widths; kills jitter-sized "swipes"
+  swipe_straightness_min: 0.6  # net displacement / path length; rejects wavy/curved motions
+  swipe_axis_dominance: 1.5    # |dx| must be this many times |dy| to call a swipe horizontal
+
+laser:
+  smoothing_alpha: 0.35     # EMA on the index fingertip while laser_pointer is active
+
+web:
+  host: 127.0.0.1           # localhost only for now -- see prd.md open item on Jetson/BLE
+  port: 5000
+  auto_open_browser: true
+
+recording:
+  countdown_seconds: 2.0        # "get ready" pause after you finish typing the name,
+                                # before capture actually starts
+  # Trajectory samples are re-segmented offline through the SAME MotionSegmenter
+  # used live, so a recorded template is trimmed exactly like a live segment.
+  # Without this, templates would carry dead time at both ends that live
+  # segments never have, and every match would be systematically off.
+  resegment_trajectory: true
+
+actions:
+  cooldown_seconds: 0.8         # SHARED across both recognizers (PRD 4.5)
+  keystroke_enabled: true       # false == dry run; overridden by app.py --dry-run
+
+logging:
+  event_csv: logs/events.csv
+  frame_csv: logs/frames.csv    # only written when app.py --log-frames is passed
+  verbose_scores: true          # print every classification attempt (accept AND reject) to stdout
