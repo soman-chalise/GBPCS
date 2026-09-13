@@ -14,8 +14,16 @@ camera:
   #   "http://192.168.42.129:8080/video" IP Webcam over USB tethering (no driver needed)
   # Override without editing this file:  app.py --camera 1
   source: 0
-  width: 1280
-  height: 720
+  # 720p was costing CPU/RAM for nothing: MediaPipe's hand model internally
+  # works on a small crop regardless of input size, so every extra pixel here
+  # only pays for a heavier CLAHE pass, a heavier BGR<->RGB/LAB conversion, and
+  # a bigger JPEG encode -- all done every frame, on the same thread as
+  # detection. 640x480 keeps landmark accuracy (hands are a large fraction of
+  # the frame either way) while cutting that per-frame work by ~2.7x, which is
+  # what was capping FPS well under 30 and inflating steady-state RAM. This is
+  # also the resolution budget to plan around for the 8GB Jetson Orin target.
+  width: 640
+  height: 480
   fps: 30
   # Network streams (a phone camera) queue frames faster than we consume them,
   # so latency grows without bound. With this on, a background thread keeps
@@ -25,8 +33,8 @@ camera:
   # Cap how often we PROCESS frames. 0 = uncapped (run as fast as the camera).
   # Only meaningful together with threaded_stream, which absorbs the surplus;
   # capping a queued stream without it just builds a backlog.
-  # Override per run with:  app.py --fps 18
-  process_fps_cap: 18
+  # Override per run with:  app.py --fps 30
+  process_fps_cap: 30
   flip_horizontal: true        # mirror view, so moving your hand right moves it right on screen
 
 tracker:
@@ -131,4 +139,10 @@ actions:
 logging:
   event_csv: logs/events.csv
   frame_csv: logs/frames.csv    # only written when app.py --log-frames is passed
+  # Printing a formatted line to stdout on every accept/reject/pose-transition
+  # is real, blocking work -- worse than it looks on an embedded board where
+  # stdout is often a slow serial/SSH pipe. That said, it's also the only
+  # window into WHY a gesture misfires or gets confused with another one, so
+  # keep it on while tuning accuracy and only flip to false once thresholds
+  # are settled and you're purely chasing fps/RAM again.
   verbose_scores: true          # print every classification attempt (accept AND reject) to stdout

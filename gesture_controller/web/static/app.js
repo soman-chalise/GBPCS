@@ -24,33 +24,70 @@
       const tr = document.createElement("tr");
       if (g.builtin) tr.className = "builtin";
 
-      const select = document.createElement("select");
-      for (const c of controlOptions) {
-        const opt = document.createElement("option");
-        opt.value = c.name;
-        opt.textContent = c.label;
-        if (c.name === g.control) opt.selected = true;
-        select.appendChild(opt);
-      }
-      select.addEventListener("change", () => {
-        post("/api/bindings", { gesture: g.name, control: select.value });
-      });
-
       tr.innerHTML =
         '<td class="name">' + g.name + "</td>" +
         "<td>" + g.type + "</td>" +
         "<td>" + (g.builtin ? "-" : g.samples + " (" + g.threshold_source + ")") + "</td>";
-      const tdControl = document.createElement("td");
-      tdControl.appendChild(select);
+      const tdActions = document.createElement("td");
       if (!g.builtin) {
         const del = document.createElement("button");
         del.className = "btn small";
         del.textContent = "delete last";
-        del.style.marginLeft = "8px";
-        del.addEventListener("click", () => post("/api/samples/delete", { name: g.name }));
-        tdControl.appendChild(del);
+        del.addEventListener("click", () => post("/api/samples/delete", { name: g.name }).then(poll));
+        tdActions.appendChild(del);
       }
+      tr.appendChild(tdActions);
+      tbody.appendChild(tr);
+    }
+  }
+
+  // Controls are the fixed, listed side; each gets a dropdown of which
+  // gesture (built-in or custom) currently triggers it -- the inverse of the
+  // old per-gesture control picker.
+  function renderControls(status) {
+    const rows = status.gestures || [];
+    const tbody = document.getElementById("control-rows");
+    tbody.innerHTML = "";
+    for (const c of controlOptions) {
+      if (c.name === "none") continue;
+      const assigned = rows.find((g) => g.control === c.name);
+      const currentGesture = assigned ? assigned.name : "";
+
+      const tr = document.createElement("tr");
+      const tdControl = document.createElement("td");
+      tdControl.className = "name";
+      tdControl.textContent = c.label;
       tr.appendChild(tdControl);
+
+      const select = document.createElement("select");
+      const optNone = document.createElement("option");
+      optNone.value = "";
+      optNone.textContent = "-- unassigned --";
+      select.appendChild(optNone);
+      for (const g of rows) {
+        const opt = document.createElement("option");
+        opt.value = g.name;
+        opt.textContent = g.builtin
+          ? g.name + " *"
+          : g.name + " (" + g.type + ", " + g.samples + " sample" + (g.samples === 1 ? "" : "s") + ")";
+        if (g.name === currentGesture) opt.selected = true;
+        select.appendChild(opt);
+      }
+      select.addEventListener("change", () => {
+        const newGesture = select.value;
+        if (currentGesture && currentGesture !== newGesture) {
+          post("/api/bindings", { gesture: currentGesture, control: "none" });
+        }
+        if (newGesture) {
+          post("/api/bindings", { gesture: newGesture, control: c.name }).then(poll);
+        } else {
+          poll();
+        }
+      });
+
+      const tdGesture = document.createElement("td");
+      tdGesture.appendChild(select);
+      tr.appendChild(tdGesture);
       tbody.appendChild(tr);
     }
   }
@@ -102,6 +139,7 @@
       hint.textContent = "";
     }
 
+    renderControls(status);
     renderGestures(status);
   }
 

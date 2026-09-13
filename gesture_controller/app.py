@@ -116,6 +116,18 @@ class App:
         self.state = AppState()
         self._last_hand_present = False
 
+        # distance_report() is O(samples^2) and only changes when a sample is
+        # added/deleted -- rebuilding it every frame (it used to run inside
+        # publish_status, i.e. 30x/sec) was pure wasted CPU on the hot path
+        # and a real contributor to the FPS drop during recording sessions.
+        self._report_cache = ""
+        self._report_version = -1
+
+        self.profile = bool(getattr(args, "profile", False))
+        self._prof_acc: dict = {}
+        self._prof_n = 0
+        self._prof_t = time.time()
+
     # ==================================================================
     # setup / teardown
     # ==================================================================
@@ -212,8 +224,10 @@ class App:
                         continue
                     self._next_frame_at = time.time() + self._min_interval
 
+                t0 = time.perf_counter()
                 self.cap.wait_for_new_frame(timeout=0.5)
                 ok, frame = self.cap.read()
+                t1 = time.perf_counter()
                 if not ok:
                     print("camera read failed; stopping")
                     break
@@ -222,9 +236,10 @@ class App:
                 h, w = frame.shape[:2]
 
                 now = time.time()
-                hand = self.tracker.process(
-                    self.tracker.normalize_lighting(frame), now
-                )
+                lit = self.tracker.normalize_lighting(frame)
+                t2 = time.perf_counter()
+                hand = self.tracker.process(lit, now)
+                t3 = time.perf_counter()
 
                 status = self.segmenter.update(
                     hand.wrist_xy if hand.present else None,
@@ -262,10 +277,17 @@ class App:
                 if self.frames_log:
                     self.log_frame(hand, status)
 
+                t4 = time.perf_counter()
                 self.tick_fps()
                 self.annotate(frame, hand, status)
                 self.publish_frame(frame)
                 self.publish_status()
+                t5 = time.perf_counter()
+
+                if self.profile:
+                    self._accumulate_profile(capture=t1 - t0, lighting=t2 - t1,
+                                              mediapipe=t3 - t2, logic=t4 - t3,
+                                              draw_encode_publish=t5 - t4)
         except KeyboardInterrupt:
             print("\ninterrupted")
         finally:
@@ -314,6 +336,7 @@ class App:
                       "peak_speed={:.3f} close={})".format(
                           seg.rejected, seg.frames, seg.path_length(),
                           seg.peak_speed, seg.close_reason))
+            self.log_segment_outcome(seg, outcome="rejected", reason=seg.rejected)
             return
 
         feature = self.traj.feature_from_segment(seg)
@@ -324,7 +347,9 @@ class App:
                                     seg.close_reason))
         if res.accepted:
             action = self.mapper.trigger(res.name, "trajectory", res.distance, res.threshold)
-            self.note_event(res.name, "traj", action)
+            self.note_event(res.name, "traj", action, seg=seg, res=res)
+        else:
+            self.log_segment_outcome(seg, outcome="rejected", reason=res.reason, res=res)
 
     def handle_pose_event(self, ev) -> None:
         res = ev.result
@@ -334,7 +359,7 @@ class App:
         if self._is_laser(ev.name):
             return
         action = self.mapper.trigger(ev.name, "pose", res.distance, res.threshold)
-        self.note_event(ev.name, "pose", action)
+        self.note_event(ev.name, "pose", action, res=res)
 
     def handle_builtin_trigger(self, name: str) -> None:
         if self._is_laser(name):
@@ -354,11 +379,64 @@ class App:
         )
         self.laser.update(hand, active, frame_w, frame_h)
 
-    def note_event(self, name: str, source: str, action) -> None:
+    def note_event(self, name: str, source: str, action, seg=None, res=None) -> None:
         mark = "FIRED" if action.fired else "COOLDOWN"
         self.last_event_text = "{} [{}] {} - {}".format(name, source, mark, action.detail)
         self.last_event_time = time.time()
         print("[action] {}".format(self.last_event_text))
+        self.log_event(
+            source=source, outcome="accepted", gesture=name,
+            distance=action.distance, threshold=action.threshold,
+            fired=action.fired, key=action.control, detail=action.detail,
+            seg=seg, res=res,
+        )
+
+    def log_segment_outcome(self, seg, outcome: str, reason: str, res=None) -> None:
+        """Record a trajectory segment that never reached the mapper (either
+        discarded by the segmenter's own gates, or classified-but-rejected).
+        Without this, events.csv only ever saw accepted swipes -- no way to
+        tell a too-strict threshold from a swipe that never registered at
+        all."""
+        self.log_event(
+            source="trajectory", outcome=outcome,
+            gesture=(res.name if res else "") or "", fired=False, detail=reason,
+            distance=(res.distance if res else None),
+            threshold=(res.threshold if res else None),
+            seg=seg, res=res,
+        )
+
+    def log_event(self, source, outcome, gesture, fired, detail,
+                  distance=None, threshold=None, key=None, seg=None, res=None) -> None:
+        row = {
+            "mode": "LIVE" if self.live else "IDLE",
+            "source": source,
+            "outcome": outcome,
+            "gesture": gesture,
+            "fired": fired,
+            "key": key or "",
+            "detail": detail,
+        }
+        if distance is not None and distance == distance:      # skip NaN
+            row["distance"] = "{:.4f}".format(distance)
+        if threshold is not None and threshold == threshold:
+            row["threshold"] = "{:.4f}".format(threshold)
+        if res is not None:
+            row["threshold_source"] = res.threshold_source
+            row["margin_ratio"] = (
+                "{:.4f}".format(res.margin_ratio)
+                if res.margin_ratio == res.margin_ratio and res.margin_ratio != float("inf")
+                else ""
+            )
+            if res.runner_up_name is not None:
+                row["runner_up"] = res.runner_up_name
+                row["runner_up_distance"] = "{:.4f}".format(res.runner_up_distance)
+        if seg is not None:
+            row["seg_frames"] = seg.frames
+            row["seg_duration"] = "{:.3f}".format(seg.duration)
+            row["seg_peak_speed"] = "{:.4f}".format(seg.peak_speed)
+            row["seg_mean_speed"] = "{:.4f}".format(seg.mean_speed)
+            row["seg_close_reason"] = seg.close_reason
+        self.events.write(**row)
 
     # ==================================================================
     # session controls (formerly keyboard shortcuts)
@@ -402,6 +480,7 @@ class App:
         self.mapper = ActionMapper(self.cfg, self.bindings, dry_run=self.args.dry_run)
         self.mapper.enabled = enabled and not self.args.dry_run
         self.verbose = bool(self.cfg.logging["verbose_scores"])
+        self._report_version = -1  # thresholds may have changed; force a rebuild
         print("[config] reloaded thresholds.yaml")
 
     def delete_sample(self, name: str) -> None:
@@ -572,7 +651,10 @@ class App:
             )
         rep = ""
         if self.store.gestures:
-            rep = distance_report(self.store, self.traj, self.pose)
+            if self.store.version != self._report_version:
+                self._report_cache = distance_report(self.store, self.traj, self.pose)
+                self._report_version = self.store.version
+            rep = self._report_cache
 
         self.state.publish_status({
             "live": self.live,
@@ -614,7 +696,39 @@ class App:
             pose_best=(pr.name if pr else ""),
             pose_distance=("{:.4f}".format(pr.distance) if pr else ""),
             pose_stable=(self.pose.stable_pose or ""),
+            **self._builtin_diag_row(),
         )
+
+    def _builtin_diag_row(self) -> dict:
+        d = self.builtin.last_diag
+        if d is None:
+            return {}
+        matches = d["matches"]
+        return {
+            "thumb_curl": "{:.4f}".format(d["thumb_curl"]),
+            "thumb_tip_y": "{:.4f}".format(d["thumb_tip_y"]),
+            "index_tip_z": "{:.4f}".format(d["index_tip_z"]),
+            "builtin_match": (
+                matches[0] if len(matches) == 1
+                else ("ambiguous:" + ",".join(matches) if matches else "")
+            ),
+            "builtin_stable": self.builtin.stable_pose or "",
+        }
+
+    def _accumulate_profile(self, **stages) -> None:
+        for k, v in stages.items():
+            self._prof_acc[k] = self._prof_acc.get(k, 0.0) + v
+        self._prof_n += 1
+        if time.time() - self._prof_t >= 1.0:
+            n = max(self._prof_n, 1)
+            parts = "  ".join(
+                "{}={:.1f}ms".format(k, 1000.0 * v / n)
+                for k, v in self._prof_acc.items()
+            )
+            print("[profile] n={} fps={:.1f}  {}".format(n, n / (time.time() - self._prof_t), parts))
+            self._prof_acc = {}
+            self._prof_n = 0
+            self._prof_t = time.time()
 
     def tick_fps(self) -> None:
         self._fps_n += 1
@@ -683,6 +797,8 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=None, help="override web.port")
     ap.add_argument("--no-browser", action="store_true",
                     help="don't auto-open the control panel in a browser")
+    ap.add_argument("--profile", action="store_true",
+                    help="print per-stage timing breakdown once per second")
     args = ap.parse_args()
 
     if args.stats:

@@ -39,9 +39,19 @@
 
     <div>
       <div class="card">
-        <h2>Gestures &amp; bindings</h2>
+        <h2>Controls</h2>
         <table>
-          <thead><tr><th>gesture</th><th>type</th><th>samples</th><th>control</th></tr></thead>
+          <thead><tr><th>control</th><th>gesture</th></tr></thead>
+          <tbody id="control-rows"></tbody>
+        </table>
+        <p class="hint">Pick which gesture triggers each control. Choosing a gesture already
+          used elsewhere moves it here.</p>
+      </div>
+
+      <div class="card">
+        <h2>Gestures</h2>
+        <table>
+          <thead><tr><th>gesture</th><th>type</th><th>samples</th><th></th></tr></thead>
           <tbody id="gesture-rows"></tbody>
         </table>
         <p class="hint">* built-in, always available, no recording needed. Everything else

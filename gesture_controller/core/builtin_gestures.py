@@ -12,9 +12,11 @@ Two families, mirroring the custom-gesture architecture (PRD 4):
     by net displacement direction, straightness and axis dominance. Reuses the
     segmenter's output, not its own tracking.
 
-  * POSE (pose-family) -- per-frame geometric checks on the wrist-relative
-    landmark vector (`hand.shape`, reshaped to (21, 3)) and the curl ratios
-    already computed by `HandTracker`. Gated through a small hold-then-fire
+  * POSE (pose-family) -- per-frame geometric checks on the RAW wrist-relative
+    landmark vector (`hand.landmarks_rel`, (21, 3)) -- deliberately not
+    `hand.shape`, which is EMA-smoothed and z-weighted for the nearest-centroid
+    path and would add transition lag / distort the z-depth checks below if
+    reused here. Gated through a small hold-then-fire
     state machine, the same shape as `PoseRecognizer`'s, so a pose fires once
     on a stable transition rather than every frame it is held.
 
@@ -103,6 +105,7 @@ class BuiltinGestureDetector:
         self.swipe_straightness_min = float(b["swipe_straightness_min"])
         self.swipe_axis_dominance = float(b["swipe_axis_dominance"])
         self._debounce = _HoldDebouncer(int(b["hold_frames"]))
+        self.last_diag: Optional[Dict] = None
 
     @property
     def stable_pose(self) -> Optional[str]:
@@ -133,7 +136,12 @@ class BuiltinGestureDetector:
         return float(np.linalg.norm(rel[tip, :2] - rel[mcp, :2]))
 
     def _classify_pose_frame(self, hand) -> Optional[str]:
-        rel = np.asarray(hand.shape, dtype=np.float64).reshape(-1, 3)
+        # Raw per-frame geometry, not the smoothed/z-weighted `hand.shape` --
+        # see module docstring. Using the smoothed vector here used to blend
+        # transitional hand shapes across frames (e.g. a closing fist briefly
+        # reading as thumbs_up) and silently shrank the z-depth used by the
+        # gun_point check by `z_weight` (0.3x), independent of `gun_point_z_margin`.
+        rel = np.asarray(hand.landmarks_rel, dtype=np.float64).reshape(-1, 3)
 
         curls: Dict[str, float] = {
             name: self._finger_curl(rel, mcp, tip) for name, mcp, tip in FINGERS
@@ -178,6 +186,16 @@ class BuiltinGestureDetector:
         if all(curled[n] for n in others) and thumb_curled:
             matches.append(CLOSED_FIST_HOLD)
 
+        # Exposed for diagnostics (FrameLog / tools) -- there is otherwise no
+        # visibility at all into the rule-based side, unlike the custom
+        # recognizers' `verbose_scores` output.
+        self.last_diag = {
+            "curls": curls, "thumb_curl": thumb_curl,
+            "thumb_tip_y": float(rel[THUMB_TIP, 1]),
+            "index_tip_z": float(rel[INDEX_TIP, 2]),
+            "matches": list(matches),
+        }
+
         # A frame that matches more than one rule is ambiguous (mid-transition
         # between two shapes) -- reject rather than guess, same philosophy as
         # the margin-over-runner-up check in the custom recognizers.
@@ -189,6 +207,7 @@ class BuiltinGestureDetector:
         """One frame in, an event only on a stable-pose transition."""
         if hand is None or not hand.present:
             self._debounce.reset()
+            self.last_diag = None
             return None
         if wrist_speed > self.suppress_above_speed:
             self._debounce.freeze()

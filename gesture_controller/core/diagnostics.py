@@ -206,6 +206,7 @@ class FrameLog:
         "session_t", "hand", "wrist_x", "wrist_y", "hand_scale", "speed",
         "seg_state", "seg_buffered", "curls", "pose_best", "pose_distance",
         "pose_stable",
+        "thumb_curl", "thumb_tip_y", "index_tip_z", "builtin_match", "builtin_stable",
     ]
 
     def __init__(self, path: str):

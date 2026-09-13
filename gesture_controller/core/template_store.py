@@ -72,6 +72,10 @@ class TemplateStore:
     def __init__(self, path: str):
         self.path = path
         self.gestures: Dict[str, Gesture] = {}
+        # Bumped on every mutation. Lets callers (e.g. the per-frame status
+        # publisher) cache work derived from the store instead of recomputing
+        # it every frame -- see app.py's `_report_cache`.
+        self.version = 0
 
     # -- persistence -------------------------------------------------------
     def load(self) -> "TemplateStore":
@@ -139,12 +143,14 @@ class TemplateStore:
                 )
             )
         g.samples.append(Sample(feature=feat, recorded_at=time.time(), meta=meta or {}))
+        self.version += 1
         self.save()
         return g
 
     def delete_gesture(self, name: str) -> bool:
         if name in self.gestures:
             del self.gestures[name]
+            self.version += 1
             self.save()
             return True
         return False
@@ -156,6 +162,7 @@ class TemplateStore:
         g.samples.pop()
         if not g.samples:
             del self.gestures[name]
+        self.version += 1
         self.save()
         return True
 

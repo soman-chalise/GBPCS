@@ -135,11 +135,26 @@ tr.builtin td.name::after { content: " *"; color: var(--muted); }
 select {
   font: inherit;
   font-size: 0.8rem;
-  padding: 5px 6px;
+  padding: 7px 28px 7px 8px;
   border: 2px solid var(--line);
-  background: var(--panel);
   border-radius: 2px;
+  color: var(--ink);
+  background-color: var(--panel);
+  box-shadow: var(--shadow-sm);
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23111111'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 10px 6px;
+  cursor: pointer;
+  max-width: 100%;
 }
+select:active { box-shadow: none; transform: translate(3px, 3px); }
+select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+#control-rows select { width: 100%; }
 
 input[type=text] {
   font: inherit;

@@ -1,17 +1,23 @@
 """Camera frame source -- device index or network stream.
 
 The interesting part is `threaded`. A USB camera's `read()` blocks on hardware,
-so it can never run ahead of us. A network stream (a phone camera app) is the
-opposite: it pushes frames into a queue as fast as it likes, and every frame we
-fail to consume becomes permanent latency. `CAP_PROP_BUFFERSIZE` is documented
-to bound that queue but is a no-op on the FFMPEG backend used for http://
+so it can never run ahead of us -- but that block (a driver-level USB
+transfer, milliseconds to tens of milliseconds depending on wire format) is
+CPU-idle time. Pumping it on its own thread lets that wait overlap with
+MediaPipe inference on the main thread instead of the two being paid for back
+to back every frame -- often the single biggest lever on effective FPS, since
+capture and inference are independent resources (USB I/O vs CPU). A network
+stream (a phone camera app) has the same treatment for a different reason: it
+pushes frames into a queue as fast as it likes, and every frame we fail to
+consume becomes permanent latency. `CAP_PROP_BUFFERSIZE` is documented to
+bound that queue but is a no-op on the FFMPEG backend used for http://
 sources, so it cannot be relied on.
 
-The fix is to drain continuously on a background thread and keep only the most
-recent frame. The main loop then always gets the newest image, and surplus
-frames are dropped instead of queued. This is also what makes a processing FPS
-cap safe: without draining, consuming slower than the stream produces just
-grows the backlog.
+The fix in both cases is to drain continuously on a background thread and keep
+only the most recent frame. The main loop then always gets the newest image,
+and surplus frames are dropped instead of queued. This is also what makes a
+processing FPS cap safe: without draining, consuming slower than the stream
+produces just grows the backlog.
 """
 
 from __future__ import annotations
@@ -29,14 +35,27 @@ class FrameSource:
     def __init__(self, source, threaded: bool = False):
         self.source = source
         self.is_url = isinstance(source, str)
-        self.threaded = threaded and self.is_url
+        self.threaded = threaded
 
         if self.is_url:
             self.cap = cv2.VideoCapture(source)
         else:
-            backend = cv2.CAP_DSHOW if sys.platform == "win32" else 0
-            self.cap = cv2.VideoCapture(source, backend)
-            if not self.cap.isOpened():
+            # DSHOW is the traditional default backend on Windows, but on at
+            # least some UVC webcams/drivers it negotiates a markedly lower
+            # real capture rate than MSMF at the same resolution/fourcc
+            # request (measured ~14fps vs ~23fps on the same device here) --
+            # try MSMF first and fall back if it can't open the device.
+            backends = (
+                [cv2.CAP_MSMF, cv2.CAP_DSHOW] if sys.platform == "win32" else [0]
+            )
+            self.cap = None
+            for backend in backends:
+                cap = cv2.VideoCapture(source, backend)
+                if cap.isOpened():
+                    self.cap = cap
+                    break
+                cap.release()
+            if self.cap is None:
                 self.cap = cv2.VideoCapture(source)
 
         self._lock = threading.Lock()
@@ -60,9 +79,39 @@ class FrameSource:
             # Resolution belongs to the phone app; asking here does nothing.
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             return
+        # Force MJPG on the wire before negotiating resolution/fps. Most UVC
+        # webcams fall back to raw/YUY2 by default, which saturates USB
+        # bandwidth at 720p and silently throttles the driver down to a
+        # handful of fps -- CPU stays idle because the process is blocked on
+        # the slow transfer, not computing. MJPG moves the compression onto
+        # the camera itself and is what actually unlocks the requested fps.
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_FPS, fps)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # `.set()` returns success/failure but a LOT of drivers report success
+        # while silently ignoring the request, so the only trustworthy check
+        # is reading the negotiated format back. If this isn't MJPG, the wire
+        # format is raw/YUY2 -- exactly the "saturates USB, driver throttles
+        # to a handful of fps" failure mode described above, and it will look
+        # like a CPU/recognition problem when it is actually a capture-layer
+        # one. Surface it loudly instead of failing silently.
+        got_fourcc = int(self.cap.get(cv2.CAP_PROP_FOURCC))
+        got_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        got_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        got_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        tag = "".join(chr((got_fourcc >> (8 * i)) & 0xFF) for i in range(4)).strip()
+        print("[camera] negotiated {}x{} @ {:.0f}fps, fourcc={!r}".format(
+            got_w, got_h, got_fps, tag))
+        if tag.upper() != "MJPG":
+            print("[camera] WARNING: driver did not grant MJPG (got {!r}). The "
+                  "wire format is likely uncompressed and may saturate USB "
+                  "bandwidth at this resolution, throttling fps well below "
+                  "what CPU load would predict. Try a lower camera.width/height "
+                  "in thresholds.yaml, a different USB port, or check for a "
+                  "driver-specific MJPG toggle.".format(tag))
 
     def start(self) -> "FrameSource":
         if self.threaded and self._thread is None:

@@ -62,6 +62,14 @@ class HandFrame:
     curls: Optional[np.ndarray] = None       # (4,) or (5,) per-finger curl ratios
     curl_names: tuple = ()
     pixels: Optional[np.ndarray] = None      # (21,2) int pixel coords, for drawing only
+    landmarks_rel: Optional[np.ndarray] = None  # (21,3) wrist-relative, scale-normalized,
+                                                 # RAW -- no EMA smoothing, no z_weight scaling.
+                                                 # For any per-frame geometric rule (built-in
+                                                 # poses) that needs an instantaneous, undistorted
+                                                 # read. `shape` below is smoothed and z-weighted
+                                                 # for the nearest-centroid path and must not be
+                                                 # reused for rule-based thresholds -- see
+                                                 # builtin_gestures.py.
 
 
 class HandTracker:
@@ -135,8 +143,13 @@ class HandTracker:
         if scale < 1e-6:
             return HandFrame(present=False, timestamp=timestamp)
 
-        # --- stream 1: shape vector (pose recognizer) ---------------------
-        rel = (pts - pts[WRIST]) / scale
+        # --- stream 1: shape vector (nearest-centroid path) ---------------
+        # Keep the raw wrist-relative geometry around BEFORE z-weighting/EMA
+        # for anything that needs an instantaneous, undistorted read (the
+        # built-in rule-based poses) -- only the copy fed to the smoothed
+        # `shape` output below gets z_weight applied and gets EMA'd.
+        landmarks_rel = (pts - pts[WRIST]) / scale
+        rel = landmarks_rel.copy()
         rel[:, 2] *= self._z_weight
         shape = rel.reshape(-1)
         shape = self._ema(shape, "_ema_shape", self._alpha_shape)
@@ -161,6 +174,7 @@ class HandTracker:
             curls=curls,
             curl_names=curl_names,
             pixels=pixels,
+            landmarks_rel=landmarks_rel,
         )
 
     # -- helpers -----------------------------------------------------------
