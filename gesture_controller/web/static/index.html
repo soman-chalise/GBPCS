@@ -11,79 +11,114 @@
   <h1>Gesture Controller</h1>
   <p class="sub">Local control panel &mdash; <span id="mode-pill" class="pill idle">IDLE</span></p>
 
-  <div class="grid">
-    <div>
-      <div class="card">
-        <h2>Live preview</h2>
-        <div class="preview-box"><img id="preview" src="/stream.mjpg" alt="camera preview"></div>
-        <div class="status-row">
-          <span><span class="k">fps</span> <b id="s-fps">-</b></span>
-          <span><span class="dot" id="s-hand-dot"></span><span id="s-hand">no hand</span></span>
-          <span><span class="k">cooldown</span> <b id="s-cooldown">0.0s</b></span>
-        </div>
-        <div class="last-event" id="s-last-event">no events yet</div>
-      </div>
-
-      <div class="card">
-        <h2>Session</h2>
-        <div class="btn-row">
-          <button class="btn primary" id="btn-live">Go LIVE</button>
-          <button class="btn" id="btn-keys">Keystrokes: ON</button>
-          <button class="btn" id="btn-reset">Reset stats</button>
-          <button class="btn" id="btn-reload">Reload config</button>
-        </div>
-        <p class="hint">"Keystrokes ON" actually sends input to the focused window. Turn it
-          off to validate gestures without driving another app.</p>
-      </div>
-    </div>
-
-    <div>
-      <div class="card">
-        <h2>Controls</h2>
-        <table>
-          <thead><tr><th>control</th><th>gesture</th></tr></thead>
-          <tbody id="control-rows"></tbody>
-        </table>
-        <p class="hint">Pick which gesture triggers each control. Choosing a gesture already
-          used elsewhere moves it here.</p>
-      </div>
-
-      <div class="card">
-        <h2>Gestures</h2>
-        <table>
-          <thead><tr><th>gesture</th><th>type</th><th>samples</th><th></th></tr></thead>
-          <tbody id="gesture-rows"></tbody>
-        </table>
-        <p class="hint">* built-in, always available, no recording needed. Everything else
-          is a custom gesture you recorded below.</p>
-      </div>
-
-      <div class="card">
-        <h2>Record a custom gesture</h2>
-        <div class="field">
-          <label>name</label>
-          <input type="text" id="rec-name" placeholder="e.g. wave">
-        </div>
-        <div class="field">
-          <label>type</label>
-          <div class="radio-row">
-            <label><input type="radio" name="rec-type" value="trajectory" checked> trajectory (swipe-like)</label>
-            <label><input type="radio" name="rec-type" value="pose"> pose (hand-shape)</label>
-          </div>
-        </div>
-        <div class="btn-row">
-          <button class="btn primary" id="btn-record">Start recording</button>
-          <button class="btn danger" id="btn-cancel" disabled>Cancel</button>
-        </div>
-        <p class="hint" id="rec-hint"></p>
-      </div>
-
-      <div class="card">
-        <h2>Distance report</h2>
-        <pre class="report" id="report">(no custom gestures recorded yet)</pre>
-      </div>
-    </div>
+  <div class="tabs" role="tablist">
+    <button class="tab active" data-tab="main" role="tab">Main</button>
+    <button class="tab" data-tab="record" role="tab">Record gesture</button>
+    <button class="tab" data-tab="gestures" role="tab">Gestures</button>
   </div>
+
+  <!-- ============================== MAIN ============================== -->
+  <section class="tab-panel active" id="tab-main">
+    <div class="grid">
+      <div>
+        <div class="card">
+          <h2>Status</h2>
+          <div class="status-row">
+            <span><span class="k">fps</span> <b id="s-fps">-</b></span>
+            <span><span class="dot" id="s-hand-dot"></span><span id="s-hand">no hand</span></span>
+            <span><span class="k">cooldown</span> <b id="s-cooldown">0.0s</b></span>
+          </div>
+          <div class="last-event" id="s-last-event">no events yet</div>
+        </div>
+
+        <div class="card">
+          <h2>Session</h2>
+          <div class="btn-row">
+            <button class="btn primary" id="btn-live">Go LIVE</button>
+            <button class="btn" id="btn-keys">Keystrokes: ON</button>
+            <button class="btn" id="btn-reset">Reset stats</button>
+            <button class="btn" id="btn-reload">Reload config</button>
+          </div>
+          <p class="hint">"Keystrokes ON" actually sends input to the focused window. Turn it
+            off to validate gestures without driving another app.</p>
+        </div>
+
+        <div class="card">
+          <h2>Camera preview</h2>
+          <p class="hint">There's no video here in the browser on purpose &mdash; it runs as a
+            small floating window on this machine instead, which needs far less processing.
+            By default it's hidden while you're looking at this panel and pops up on top of
+            whatever you switch to (e.g. your slides). It always shows while recording.</p>
+          <label class="switch-row">
+            <input type="checkbox" id="chk-pin">
+            <span>Always keep it on top, even while I'm on this page</span>
+          </label>
+          <p class="hint" id="preview-hint"></p>
+        </div>
+      </div>
+
+      <div>
+        <div class="card">
+          <h2>Live keystrokes</h2>
+          <p class="hint">The last actions the gesture recognizer fired &mdash; newest first.</p>
+          <ul class="feed" id="event-feed"><li class="feed-empty">no events yet</li></ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================= RECORD ============================= -->
+  <section class="tab-panel" id="tab-record">
+    <div class="card">
+      <h2>Record a custom gesture</h2>
+      <p class="hint">The floating camera window opens automatically the moment you start
+        recording, so you can see your hand while you perform the gesture.</p>
+      <div class="field">
+        <label>name</label>
+        <input type="text" id="rec-name" placeholder="e.g. wave">
+      </div>
+      <div class="field">
+        <label>type</label>
+        <div class="radio-row">
+          <label><input type="radio" name="rec-type" value="trajectory" checked> trajectory (swipe-like)</label>
+          <label><input type="radio" name="rec-type" value="pose"> pose (hand-shape)</label>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn primary" id="btn-record">Start recording</button>
+        <button class="btn danger" id="btn-cancel" disabled>Cancel</button>
+      </div>
+      <p class="hint" id="rec-hint"></p>
+    </div>
+  </section>
+
+  <!-- ============================ GESTURES ============================= -->
+  <section class="tab-panel" id="tab-gestures">
+    <div class="card">
+      <h2>Controls</h2>
+      <table>
+        <thead><tr><th>control</th><th>gesture</th></tr></thead>
+        <tbody id="control-rows"></tbody>
+      </table>
+      <p class="hint">Pick which gesture triggers each control. Choosing a gesture already
+        used elsewhere moves it here.</p>
+    </div>
+
+    <div class="card">
+      <h2>Gestures</h2>
+      <table>
+        <thead><tr><th>gesture</th><th>type</th><th>samples</th><th></th></tr></thead>
+        <tbody id="gesture-rows"></tbody>
+      </table>
+      <p class="hint">* built-in, always available, no recording needed. Everything else
+        is a custom gesture you recorded on the Record tab.</p>
+    </div>
+
+    <div class="card">
+      <h2>Distance report</h2>
+      <pre class="report" id="report">(no custom gestures recorded yet)</pre>
+    </div>
+  </section>
 </div>
 <script src="app.js"></script>
 </body>

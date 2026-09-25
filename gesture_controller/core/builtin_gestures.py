@@ -10,15 +10,21 @@ Two families, mirroring the custom-gesture architecture (PRD 4):
 
   * SWIPE (trajectory-family) -- classifies a closed `MotionSegmenter.Segment`
     by net displacement direction, straightness and axis dominance. Reuses the
-    segmenter's output, not its own tracking.
+    segmenter's output, not its own tracking. No pretrained model does
+    motion/trajectory classification, so this stays a geometric rule.
 
-  * POSE (pose-family) -- per-frame geometric checks on the RAW wrist-relative
-    landmark vector (`hand.landmarks_rel`, (21, 3)) -- deliberately not
-    `hand.shape`, which is EMA-smoothed and z-weighted for the nearest-centroid
-    path and would add transition lag / distort the z-depth checks below if
-    reused here. Gated through a small hold-then-fire
-    state machine, the same shape as `PoseRecognizer`'s, so a pose fires once
-    on a stable transition rather than every frame it is held.
+  * POSE (pose-family) -- `thumbs_up`, `closed_fist_hold` and `peace_sign` are
+    read directly off `hand.gesture_label`, MediaPipe GestureRecognizer's
+    pretrained static-gesture classifier (`Thumb_Up`, `Closed_Fist`,
+    `Victory` respectively -- see core/hand_tracker.py). `gun_point` has no
+    equivalent in that model's fixed vocabulary and is the one pose still
+    classified by a geometric rule, on the RAW wrist-relative landmark vector
+    (`hand.landmarks_rel`, (21, 3)) -- deliberately not `hand.shape`, which is
+    EMA-smoothed and z-weighted for the nearest-centroid path and would add
+    transition lag / distort the z-depth check it relies on. Both sources are
+    gated through the same small hold-then-fire state machine, the shape as
+    `PoseRecognizer`'s, so a pose fires once on a stable transition rather
+    than every frame it is held.
 
 All thresholds live in `thresholds.yaml`'s `[builtin]` section.
 """
@@ -44,10 +50,19 @@ SWIPE_RIGHT = "swipe_right"
 THUMBS_UP = "thumbs_up"
 GUN_POINT = "gun_point"
 PEACE_SIGN = "peace_sign"
-OPEN_PALM_HOLD = "open_palm_hold"
 CLOSED_FIST_HOLD = "closed_fist_hold"
 
-POSE_NAMES = (THUMBS_UP, GUN_POINT, PEACE_SIGN, OPEN_PALM_HOLD, CLOSED_FIST_HOLD)
+POSE_NAMES = (THUMBS_UP, GUN_POINT, PEACE_SIGN, CLOSED_FIST_HOLD)
+
+# GestureRecognizer's pretrained canned-gesture label -> our pose name, for
+# the three poses that model already covers. gun_point has no equivalent in
+# its fixed vocabulary (Closed_Fist, Open_Palm, Pointing_Up, Thumb_Down,
+# Thumb_Up, Victory, ILoveYou, None) and stays a geometric rule below.
+ML_LABEL_TO_POSE = {
+    "Thumb_Up": THUMBS_UP,
+    "Closed_Fist": CLOSED_FIST_HOLD,
+    "Victory": PEACE_SIGN,
+}
 
 
 @dataclass
@@ -97,14 +112,14 @@ class BuiltinGestureDetector:
         self.finger_extended = float(b["finger_extended"])
         self.finger_curled = float(b["finger_curled"])
         self.thumb_extended = float(b["thumb_extended"])
-        self.thumb_curled = float(b["thumb_curled"])
-        self.thumb_up_y_margin = float(b["thumb_up_y_margin"])
         self.gun_point_z_margin = float(b["gun_point_z_margin"])
         self.suppress_above_speed = float(b["suppress_above_speed"])
+        self.hand_lost_grace = int(b["hand_lost_grace_frames"])
         self.swipe_min_path_length = float(b["swipe_min_path_length"])
         self.swipe_straightness_min = float(b["swipe_straightness_min"])
         self.swipe_axis_dominance = float(b["swipe_axis_dominance"])
         self._debounce = _HoldDebouncer(int(b["hold_frames"]))
+        self._absent_run = 0
         self.last_diag: Optional[Dict] = None
 
     @property
@@ -113,6 +128,7 @@ class BuiltinGestureDetector:
 
     def reset_state(self) -> None:
         self._debounce.reset()
+        self._absent_run = 0
 
     # -- swipe family --------------------------------------------------------
     def classify_swipe(self, segment) -> Optional[str]:
@@ -151,21 +167,23 @@ class BuiltinGestureDetector:
         extended = {n: v > self.finger_extended for n, v in curls.items()}
         curled = {n: v < self.finger_curled for n, v in curls.items()}
         thumb_extended = thumb_curl > self.thumb_extended
-        thumb_curled = thumb_curl < self.thumb_curled
 
-        others = ("index", "middle", "ring", "pinky")
         matches: List[str] = []
 
-        # thumbs_up: thumb extended and pointing up, everything else curled.
-        if (
-            thumb_extended
-            and all(curled[n] for n in others)
-            and rel[THUMB_TIP, 1] < -self.thumb_up_y_margin
-        ):
-            matches.append(THUMBS_UP)
+        # thumbs_up / closed_fist_hold / peace_sign: read straight off
+        # GestureRecognizer's pretrained classifier (see hand_tracker.py and
+        # ML_LABEL_TO_POSE above) instead of the old hand-tuned geometric
+        # rules -- this is the part that used to misfire on wrist rotation
+        # (the thumb-tip-vs-wrist-y discriminator) and was the actual
+        # motivation for this switch.
+        mapped = ML_LABEL_TO_POSE.get(hand.gesture_label)
+        if mapped is not None:
+            matches.append(mapped)
 
-        # gun_point: index + thumb extended, index tip closer to camera than
-        # the wrist (the "pointing at camera" part), the rest curled.
+        # gun_point: no equivalent in the pretrained model's fixed vocabulary,
+        # so it's still the geometric rule -- index + thumb extended, index
+        # tip closer to camera than the wrist (the "pointing at camera"
+        # part), the rest curled.
         if (
             extended["index"]
             and thumb_extended
@@ -174,18 +192,6 @@ class BuiltinGestureDetector:
         ):
             matches.append(GUN_POINT)
 
-        # peace_sign: index + middle extended, ring + pinky curled.
-        if extended["index"] and extended["middle"] and curled["ring"] and curled["pinky"]:
-            matches.append(PEACE_SIGN)
-
-        # open_palm_hold: everything extended, including the thumb.
-        if all(extended[n] for n in others) and thumb_extended:
-            matches.append(OPEN_PALM_HOLD)
-
-        # closed_fist_hold: everything curled, including the thumb.
-        if all(curled[n] for n in others) and thumb_curled:
-            matches.append(CLOSED_FIST_HOLD)
-
         # Exposed for diagnostics (FrameLog / tools) -- there is otherwise no
         # visibility at all into the rule-based side, unlike the custom
         # recognizers' `verbose_scores` output.
@@ -193,12 +199,15 @@ class BuiltinGestureDetector:
             "curls": curls, "thumb_curl": thumb_curl,
             "thumb_tip_y": float(rel[THUMB_TIP, 1]),
             "index_tip_z": float(rel[INDEX_TIP, 2]),
+            "gesture_label": hand.gesture_label or "",
+            "gesture_score": float(hand.gesture_score),
             "matches": list(matches),
         }
 
-        # A frame that matches more than one rule is ambiguous (mid-transition
-        # between two shapes) -- reject rather than guess, same philosophy as
-        # the margin-over-runner-up check in the custom recognizers.
+        # A frame that matches more than one source is ambiguous (e.g. the
+        # pretrained model and the gun_point rule both fired) -- reject
+        # rather than guess, same philosophy as the margin-over-runner-up
+        # check in the custom recognizers.
         if len(matches) != 1:
             return None
         return matches[0]
@@ -206,9 +215,17 @@ class BuiltinGestureDetector:
     def update_pose(self, hand, wrist_speed: float) -> Optional[BuiltinPoseEvent]:
         """One frame in, an event only on a stable-pose transition."""
         if hand is None or not hand.present:
-            self._debounce.reset()
+            # Tolerate a short tracking dropout rather than wiping the stable
+            # pose on every single-frame flicker -- see thresholds.yaml's
+            # hand_lost_grace_frames note (same rationale as PoseRecognizer).
+            self._absent_run += 1
             self.last_diag = None
+            if self._absent_run <= self.hand_lost_grace:
+                self._debounce.freeze()
+            else:
+                self._debounce.reset()
             return None
+        self._absent_run = 0
         if wrist_speed > self.suppress_above_speed:
             self._debounce.freeze()
             return None

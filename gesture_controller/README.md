@@ -21,9 +21,9 @@ in your browser — there is no OpenCV window or keyboard shortcut anymore.
 
 - Recognizes hand gestures from a webcam (or a phone camera, see
   `SETUP.md`) in real time, no GPU needed.
-- Seven gestures ship **built-in** — work immediately, no setup:
+- Six gestures ship **built-in** — work immediately, no setup:
   `swipe_left`, `swipe_right`, `thumbs_up`, `gun_point`, `peace_sign`,
-  `open_palm_hold`, `closed_fist_hold`.
+  `closed_fist_hold`.
 - You can also **record your own custom gestures** through the web panel —
   one sample is enough to go live.
 - Any gesture, built-in or custom, can be **bound to any control** (next
@@ -95,7 +95,7 @@ gesture_controller/
   data/bindings.json              gesture -> control mapping (survives restarts)
   logs/events.csv                 every classification, accepted and rejected
   logs/frames.csv                  per-frame trace (only with --log-frames)
-  models/hand_landmarker.task
+  models/gesture_recognizer.task
   tools/                           selftest.py, camera_check.py, find_phone_camera.py
   app.py                           camera + recognition loop, no GUI
 ```

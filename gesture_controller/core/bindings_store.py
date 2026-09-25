@@ -29,7 +29,6 @@ BUILTIN_GESTURES: List[str] = [
     "thumbs_up",
     "gun_point",
     "peace_sign",
-    "open_palm_hold",
     "closed_fist_hold",
 ]
 
@@ -40,7 +39,6 @@ DEFAULT_BINDINGS: Dict[str, str] = {
     "swipe_left": "previous_slide",
     "thumbs_up": "start_presentation",
     "gun_point": "laser_pointer",
-    "open_palm_hold": "blank_screen",
     "closed_fist_hold": "first_slide",
     "peace_sign": "end_presentation",
 }

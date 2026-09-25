@@ -44,10 +44,14 @@ built-in pose), all converging on one shared cooldown/binding/action layer.
 Camera (webcam or phone stream)
    │
    ▼
-core/frame_source.py         -- backend abstraction, threaded "newest frame only" draining
+core/frame_source.py         -- backend abstraction; threaded "newest frame only" draining
+                                 (camera.threaded_stream, default true -- correct for a
+                                 network/phone stream and the deployment rig; per-machine
+                                 caveat for a local dev webcam in SETUP.md §9)
    │
    ▼
-core/hand_tracker.py         -- MediaPipe HandLandmarker (21 landmarks), CLAHE lighting fix
+core/hand_tracker.py         -- MediaPipe GestureRecognizer (21 landmarks + pretrained
+                                 static-gesture label), CLAHE lighting fix
    │
    ├── shape (63-dim, EMA-smoothed, wrist-relative, scale-normalized)
    ├── wrist_xy (2D, EMA-smoothed, SEPARATE filter from shape)
@@ -94,8 +98,17 @@ layer, not just the top one — see section 7 for why.
 
 **File:** `core/hand_tracker.py`. The only module that talks to MediaPipe.
 
-- **Model:** MediaPipe Tasks `HandLandmarker`, `VIDEO` running mode,
-  `num_hands=1`. Produces 21 (x, y, z) landmarks per hand per frame.
+- **Model:** MediaPipe Tasks `GestureRecognizer` (not plain `HandLandmarker`),
+  `VIDEO` running mode, `num_hands=1`. It runs hand detection internally, so
+  it still produces the same 21 (x, y, z) landmarks per hand per frame that
+  everything below is built on — one model, one inference per frame, not
+  two — and additionally ships a pretrained static-gesture classifier
+  (`Closed_Fist`, `Open_Palm`, `Pointing_Up`, `Thumb_Down`, `Thumb_Up`,
+  `Victory`, `ILoveYou`, `None`), exposed per-frame as
+  `HandFrame.gesture_label`/`gesture_score` and gated by
+  `builtin.gesture_min_confidence` (`canned_gesture_classifier_options.score_threshold`).
+  Only `core/builtin_gestures.py` consumes this label — the custom
+  recognizers (section 6) only ever see landmarks, never this classifier.
 - **Lighting normalization:** CLAHE (Contrast-Limited Adaptive Histogram
   Equalization) on the L channel of LAB color space, before detection. Cheap,
   and meaningfully improves detection in dim rooms.
@@ -132,6 +145,19 @@ layer, not just the top one — see section 7 for why.
   gesture that most needed to be caught. Full-frame detection was measured at
   ~18ms of a 33ms frame budget; the webcam's own frame rate is the actual
   bottleneck, not detection.
+- **EMA state is dropped the instant a frame has no hand** (`process()`
+  calls `reset_smoothing()` before returning `present=False`). MediaPipe
+  flickers present/absent for a single frame often enough in practice
+  (visible in `logs/frames.csv`) that leaving the old EMA state in place was
+  a real bug: the next real detection would blend the true (possibly far
+  away) new position with the stale pre-loss value, producing a phantom
+  multi-frame "glide" from the old position toward the new one. The motion
+  segmenter read that glide as genuine swipe motion — so a swipe would fire
+  based on where the hand *ended up relative to before it flickered*, not on
+  an actual swiping motion — and the pose recognizers' `suppress_above_speed`
+  gate read the same phantom speed spike as fast wrist motion and froze
+  hold-tracking, making a held `thumbs_up`/fist unreliable. Resetting on loss
+  means the first frame back is always the raw, undistorted reading.
 
 ---
 
@@ -149,14 +175,14 @@ recorded through the web panel (nearest-centroid / nearest-neighbour). They
 adapt to your exact hand and motion, but need at least one recording.
 
 **Built-in** gestures (`swipe_left`, `swipe_right`, `thumbs_up`, `gun_point`,
-`peace_sign`, `open_palm_hold`, `closed_fist_hold`) are fixed geometric rules
+`peace_sign`, `closed_fist_hold`) are fixed geometric rules
 tuned once, in `thresholds.yaml`'s `[builtin]` section, and need **no
 recording at all** — they must work the moment the app starts. The tradeoff
 is they're less personalized: they use population-reasonable thresholds, not
 thresholds calibrated to your hand.
 
 Both provenances run **every frame, concurrently** — a user can have a
-custom gesture *and* all seven built-ins active at once. They only ever
+custom gesture *and* all six built-ins active at once. They only ever
 collide at the shared cooldown (section 8), which guarantees at most one
 fires per physical gesture.
 
@@ -295,25 +321,32 @@ return "swipe_right" if dx > 0 else "swipe_left"
 No resampling, no template matching — just three geometric gates on the
 segment's net displacement. Cheap and deterministic.
 
-### 7.2 Built-in poses — geometric rules on `hand.shape`
+### 7.2 Built-in poses — pretrained classifier + one geometric fallback
 
-Reshapes `hand.shape` back to `(21, 3)` (wrist-relative, scale-normalized
-x/y, z downweighted ×0.3) and computes, per finger, the same curl magnitude
-the custom recognizer uses (`‖tip − MCP‖`, in this already-normalized
-space) — including the **thumb**, which the custom pose recognizer only
-includes if `pose.include_thumb` is set. The rules:
+`thumbs_up`, `closed_fist_hold` and `peace_sign` are read straight off
+`hand.gesture_label` (section 3) — MediaPipe GestureRecognizer's pretrained
+classifier, mapped `Thumb_Up → thumbs_up`, `Closed_Fist → closed_fist_hold`,
+`Victory → peace_sign` (`ML_LABEL_TO_POSE` in `builtin_gestures.py`). This
+replaced hand-tuned geometric rules (thumb-tip-vs-wrist-y, curl thresholds)
+that misfired on wrist rotation — the original motivation for switching to a
+pretrained model.
 
-| gesture | condition |
-|---|---|
-| `thumbs_up` | thumb extended, index/middle/ring/pinky all curled, **and** thumb tip is above the wrist by at least `thumb_up_y_margin` (0.35) — the "up" direction check a plain curl magnitude can't express |
-| `gun_point` | index + thumb extended, middle/ring/pinky curled, **and** index fingertip's relative z is closer to the camera than the wrist by `gun_point_z_margin` (0.05) — the "pointing at the camera" check, using MediaPipe's depth axis (smaller/more-negative z = closer to camera) |
-| `peace_sign` | index + middle extended, ring + pinky curled |
-| `open_palm_hold` | all five fingers (incl. thumb) extended |
-| `closed_fist_hold` | all five fingers (incl. thumb) curled |
+`gun_point` has no equivalent in that model's fixed vocabulary
+(`Closed_Fist, Open_Palm, Pointing_Up, Thumb_Down, Thumb_Up, Victory,
+ILoveYou, None`) and is the one pose still classified by a geometric rule, on
+`hand.landmarks_rel` reshaped to `(21, 3)` (wrist-relative, scale-normalized,
+raw/unsmoothed): index + thumb extended, middle/ring/pinky curled, **and**
+index fingertip's relative z is closer to the camera than the wrist by
+`gun_point_z_margin` (0.05) — the "pointing at the camera" check, using
+MediaPipe's depth axis (smaller/more-negative z = closer to camera).
+Extension/curl for this rule use per-finger thresholds (`finger_extended`
+0.88, `finger_curled` 0.50, and a separate `thumb_extended`, since the
+thumb's geometry differs from the other four fingers) — these three
+constants exist purely for `gun_point` now.
 
-Extension/curl use per-finger thresholds (`finger_extended` 0.85,
-`finger_curled` 0.55, and separate `thumb_extended`/`thumb_curled` since the
-thumb's geometry differs from the other four fingers).
+`open_palm_hold` (all five fingers extended) shipped but never fired
+reliably in practice and was removed rather than kept as a source of dead
+weight in the control list.
 
 **If a frame's geometry matches more than one rule simultaneously** (e.g.
 mid-transition between two shapes), the frame is treated as **no match** —
@@ -327,6 +360,19 @@ as its own tiny class here rather than sharing code with
 `pose_recognizer.py`, since it's only reused across the five built-in poses.
 `suppress_above_speed` (0.20) freezes it during fast wrist motion, same
 rationale as the custom recognizer.
+
+**Tolerating a brief tracking dropout.** Both `_HoldDebouncer` (here) and
+`PoseRecognizer` (6.2) used to fully reset — clearing the *stable* pose, not
+just the in-progress hold count — on any single frame with no hand detected.
+Since MediaPipe genuinely flickers present/absent for one frame at a time
+fairly often, this made a held `thumbs_up`/`closed_fist_hold` unreliable: one
+stray blip mid-hold threw away all accumulated `hold_frames` progress (and
+forgot that the pose was already stable, so it would need to re-qualify from
+scratch even though the user never released it). Both now tolerate up to
+`hand_lost_grace_frames` (4) consecutive absent frames by freezing — pausing
+the in-progress hold count without forgetting the stable pose — and only
+fully reset past that, mirroring the segmenter's own `hand_lost_grace_frames`
+philosophy (section 5) for the pose side.
 
 ---
 
@@ -346,7 +392,7 @@ recognizer code** — the entire point of the web control panel.
   gestures get sensible defaults seeded on first run
   (`swipe_right→next_slide`, `swipe_left→previous_slide`,
   `thumbs_up→start_presentation`, `gun_point→laser_pointer`,
-  `open_palm_hold→blank_screen`, `closed_fist_hold→first_slide`,
+  `closed_fist_hold→first_slide`,
   `peace_sign→end_presentation`), but every one of those is freely
   reassignable from the web panel afterward — nothing is hard-locked in
   code.
@@ -407,35 +453,94 @@ through one small, deliberately dumb hand-off object:
 class AppState:
     publish_status(dict)   # main thread writes, web thread reads
     get_status() -> dict
-    publish_frame(jpeg_bytes)
-    get_frame() -> bytes
     send_command(**cmd)    # web thread writes (a POST route), main thread reads
     drain_commands() -> [cmd, ...]
 ```
 
 Every mutating web route (`/api/live`, `/api/bindings`, `/api/record/start`,
-etc.) does **nothing but enqueue a command** and return immediately. The
-main loop drains the queue once per frame (`App.process_commands()`) and is
-the **only** thread that ever actually calls `self.bindings.set(...)`,
-`self.store.add_sample(...)`, toggles `self.live`, etc. This means:
+`/api/panel_focus`, `/api/preview/pin`, etc.) does **nothing but enqueue a
+command** and return immediately. The main loop drains the queue once per
+frame (`App.process_commands()`) and is the **only** thread that ever
+actually calls `self.bindings.set(...)`, `self.store.add_sample(...)`,
+toggles `self.live`, flips `self.preview_pinned`, etc. This means:
 
 - No locks needed around `App`'s own state — only `AppState`'s tiny
   internal lock, guarding a dict swap and a queue.
 - A rebind or a "start recording" click takes effect one frame later
   (≤ ~50ms) — imperceptible, and avoids any risk of tearing state mid-frame.
 - GET routes (`/api/status`, `/api/controls`) just read the latest published
-  snapshot; `/stream.mjpg` is a generator that polls `get_frame()` and
-  yields a new JPEG about every 30ms (`cv2.imencode`, quality 70).
+  snapshot.
+
+**There is no video in the browser, on purpose** — no MJPEG stream, no
+`<img>`/`<video>` tag, nothing for Flask to encode or serve frame-by-frame.
+The camera feed only ever exists as the native `cv2` floating window
+(`App.show_frame`, section below); the web panel is pure status/control
+JSON. That is a real processing saving, not just a UI choice: encoding and
+serving a live JPEG stream every frame is real, blocking work this build
+does not pay for at all.
 
 The frontend (`web/static/app.js`) is plain JS, no framework: it polls
-`/api/status` every 400ms and re-renders the gesture/control table, status
-row, and record-flow hint from whatever it gets back. Every button click is
-a `fetch()` POST.
+`/api/status` every 400ms and re-renders whichever tab is currently visible
+from whatever it gets back. Three tabs, plain show/hide (`.tab-panel.active`
+in CSS, no client-side routing) so none of them are ever a long page the
+user has to scroll past the others to reach:
+
+1. **Main** — status, session controls (LIVE/keystrokes/reset/reload), the
+   camera-preview pin toggle (see below), and a "live keystrokes" feed —
+   the last few entries of `ActionMapper.history`, reused rather than kept
+   as a second parallel log, rendered newest-first.
+2. **Record gesture** — just the recording card, on its own.
+3. **Gestures** — the control↔gesture bindings table, the gesture list, and
+   the distance report.
+
+Every button click is a `fetch()` POST; the page also runs a focus/blur/
+visibility heartbeat (see below) independent of the 400ms status poll.
 
 The page binds to `127.0.0.1` only (`web.host` in `thresholds.yaml`) — this
 build deliberately does not attempt Bluetooth HID or a Jetson-hosted
 version; see `prd.md`'s open items and the "Future: Jetson / Bluetooth HID"
 note in `SETUP.md`.
+
+### 9.1 The floating camera preview
+
+`App.show_frame` (app.py) owns a single native `cv2` window, shown or hidden
+by `App._want_preview_visible()`:
+
+```
+show it if:  recording (only visual feedback while capturing a sample)
+          or preview_pinned (web panel's "always keep it on top" toggle)
+          or the web panel does NOT currently have focus
+otherwise: hide it (destroy the window -- no imshow, no draw cost at all)
+```
+
+"Does the web panel have focus" is not guessed from window titles — the
+page itself reports it via `/api/panel_focus`, driven by `focus`/`blur`/
+`visibilitychange` plus a 1s heartbeat (in case a browser fails to fire
+those reliably). A stale heartbeat (tab/browser closed outright) times out
+after `PANEL_FOCUS_TIMEOUT` (3s) and is treated as "not focused" too, so the
+preview does not stay hidden forever with no page left to un-hide it. This
+is the mechanism behind "switch away from the browser (e.g. to your slides)
+and the camera preview appears on top by default" — and the *only* way to
+change that default is the pin toggle on the Main tab, not some hidden
+keyboard shortcut or the native window's own close button (closing it
+manually just makes it pop back up the next frame it's wanted, same as
+before it was closed — the pin toggle is the one place that actually
+changes the behaviour, per design).
+
+When shown, the window is created `WINDOW_NORMAL` (resizable) and sized
+once via `cv2.resizeWindow` to a small aspect-correct default — sized from
+the *client* area directly, which is why the video is never clipped by
+title-bar/border chrome. (An earlier version forced the window's outer
+rect via a raw win32 `SetWindowPos` width/height, which does eat into that
+chrome and was clipping the visible video — the "small but cropped" bug.)
+Position and always-on-top are only actively (re)applied once, at the
+moment the window transitions from hidden to shown (bottom-left corner of
+whichever monitor has the user's current foreground window, or wherever it
+already is if none is found) — after that, on-top is passively reasserted
+every `PREVIEW_TOPMOST_RECHECK_SECONDS` (0.5s) without moving or resizing
+anything, so the user is free to drag or resize it and it stays put (the
+"dynamic, don't keep it fixed" behaviour) instead of snapping back every
+half second like the previous always-repositioning version did.
 
 ---
 

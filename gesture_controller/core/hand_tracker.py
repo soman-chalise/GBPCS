@@ -1,4 +1,4 @@
-"""MediaPipe HandLandmarker wrapper + base feature extraction (PRD 4.1).
+"""MediaPipe GestureRecognizer wrapper + base feature extraction (PRD 4.1).
 
 This module is the ONLY place that talks to MediaPipe. It produces two
 deliberately SEPARATE streams from every frame:
@@ -10,6 +10,16 @@ They are smoothed by two independent EMA filters and are never concatenated
 into a single vector. That separation is the central architectural constraint
 from the PRD: attempt 1 mixed them into one 66-dim vector and shape jitter
 became indistinguishable from spatial motion.
+
+MODEL: MediaPipe's pretrained `GestureRecognizer` task, not the plain
+`HandLandmarker`. It runs hand detection internally (so it still produces the
+same 21-landmark-per-hand output the rest of this module is built on -- one
+model, one inference per frame, not two) and additionally ships a pretrained
+static-gesture classifier (`Closed_Fist`, `Open_Palm`, `Pointing_Up`,
+`Thumb_Down`, `Thumb_Up`, `Victory`, `ILoveYou`, `None`). That label is
+exposed as `HandFrame.gesture_label`/`gesture_score` for `builtin_gestures.py`
+to consume for the poses it has a pretrained equivalent for -- see that
+module's docstring for which ones still fall back to a geometric rule.
 
 NOTE ON ROI CROPPING: there is none. Detection runs on the full frame every
 frame, on purpose -- see README "Dropped optimizations".
@@ -25,6 +35,7 @@ import mediapipe as mp
 import numpy as np
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python import vision
+from mediapipe.tasks.python.components.processors import ClassifierOptions
 
 from .config import Config, resolve
 
@@ -70,6 +81,12 @@ class HandFrame:
                                                  # for the nearest-centroid path and must not be
                                                  # reused for rule-based thresholds -- see
                                                  # builtin_gestures.py.
+    gesture_label: Optional[str] = None      # top-1 pretrained static-gesture label this frame
+                                              # (e.g. "Thumb_Up", "Closed_Fist", "Victory"), or
+                                              # None if nothing cleared gesture_min_confidence.
+                                              # Built-in-only signal -- custom recognizers never
+                                              # see this, they only ever see landmarks.
+    gesture_score: float = 0.0
 
 
 class HandTracker:
@@ -85,15 +102,19 @@ class HandTracker:
             clipLimit=float(t["clahe_clip_limit"]), tileGridSize=(grid, grid)
         )
 
-        options = vision.HandLandmarkerOptions(
+        b = cfg.builtin
+        options = vision.GestureRecognizerOptions(
             base_options=BaseOptions(model_asset_path=resolve(t["model_path"])),
             running_mode=vision.RunningMode.VIDEO,
             num_hands=int(t["num_hands"]),
             min_hand_detection_confidence=float(t["min_hand_detection_confidence"]),
             min_hand_presence_confidence=float(t["min_hand_presence_confidence"]),
             min_tracking_confidence=float(t["min_tracking_confidence"]),
+            canned_gesture_classifier_options=ClassifierOptions(
+                score_threshold=float(b["gesture_min_confidence"])
+            ),
         )
-        self._landmarker = vision.HandLandmarker.create_from_options(options)
+        self._recognizer = vision.GestureRecognizer.create_from_options(options)
 
         # Two independent EMA states -- never a shared filter.
         self._ema_shape: Optional[np.ndarray] = None
@@ -102,7 +123,7 @@ class HandTracker:
 
     # -- lifecycle ---------------------------------------------------------
     def close(self) -> None:
-        self._landmarker.close()
+        self._recognizer.close()
 
     def reset_smoothing(self) -> None:
         """Drop EMA state, e.g. after the hand has been absent for a while."""
@@ -124,14 +145,25 @@ class HandTracker:
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-        # detect_for_video requires strictly increasing timestamps.
+        # recognize_for_video requires strictly increasing timestamps.
         ts_ms = int(timestamp * 1000)
         if ts_ms <= self._last_ts_ms:
             ts_ms = self._last_ts_ms + 1
         self._last_ts_ms = ts_ms
 
-        result = self._landmarker.detect_for_video(mp_image, ts_ms)
+        result = self._recognizer.recognize_for_video(mp_image, ts_ms)
         if not result.hand_landmarks:
+            # Drop EMA state immediately rather than on some later re-detect
+            # frame. Without this, the NEXT detected frame blends the true
+            # (possibly far away) new position with the stale pre-loss EMA
+            # value -- a phantom multi-frame "glide" from the old position to
+            # the new one that the motion segmenter reads as a real swipe, and
+            # that the speed-suppression gate reads as fast wrist motion (see
+            # module docstring's two-stream separation -- this is the same
+            # class of bug, just triggered by a tracking dropout instead of a
+            # shared filter). MediaPipe flickers present/absent often enough
+            # (see logs/frames.csv) that this fires constantly in practice.
+            self.reset_smoothing()
             return HandFrame(present=False, timestamp=timestamp)
 
         lm = result.hand_landmarks[0]
@@ -161,6 +193,20 @@ class HandTracker:
 
         curls, curl_names = self._curl_ratios(pts, scale)
 
+        # --- pretrained static-gesture label (built-in poses only) --------
+        # `score_threshold` on canned_gesture_classifier_options already
+        # dropped anything below gesture_min_confidence; the SDK still always
+        # returns a top-1 (often "None" -- the model's own explicit "no
+        # gesture recognized" category, not a Python None), so filter that
+        # out here too.
+        gesture_label: Optional[str] = None
+        gesture_score = 0.0
+        if result.gestures and result.gestures[0]:
+            top = result.gestures[0][0]
+            if top.category_name and top.category_name != "None":
+                gesture_label = top.category_name
+                gesture_score = float(top.score)
+
         pixels = np.stack(
             [(pts[:, 0] / aspect * w).astype(int), (pts[:, 1] * h).astype(int)], axis=1
         )
@@ -175,6 +221,8 @@ class HandTracker:
             curl_names=curl_names,
             pixels=pixels,
             landmarks_rel=landmarks_rel,
+            gesture_label=gesture_label,
+            gesture_score=gesture_score,
         )
 
     # -- helpers -----------------------------------------------------------

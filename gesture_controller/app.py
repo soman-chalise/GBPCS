@@ -18,6 +18,7 @@ CLI:
   --stats                print the distance report and exit, no camera
   --port N               override web.port in thresholds.yaml
   --no-browser           don't auto-open the control panel in a browser
+  --no-preview           don't open the native camera preview window
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ from core.hand_tracker import HAND_CONNECTIONS, HandTracker
 from core.laser_pointer import LaserPointerController
 from core.motion_segmenter import MotionSegmenter, MotionState
 from core.pose_recognizer import PoseRecognizer
+from core import window_utils
 from core.template_store import POSE, TRAJECTORY, TemplateStore
 from core.trajectory_recognizer import TrajectoryRecognizer
 from web.server import create_app
@@ -61,10 +63,21 @@ AMBER = (60, 200, 250)
 RED = (70, 70, 240)
 BLUE = (240, 180, 90)
 
+PREVIEW_WINDOW = "Gesture Controller -- camera preview"
+PREVIEW_TARGET_WIDTH = 360     # initial corner picture-in-picture width; height follows the
+                               # camera's own aspect ratio -- user is free to drag-resize after
+PREVIEW_MARGIN = 14
+PREVIEW_TOPMOST_RECHECK_SECONDS = 0.5  # how often to re-assert always-on-top -- win32 calls,
+                                        # not per-frame; never repositions/resizes on this tick,
+                                        # only on an actual show transition (see App.show_frame)
+PANEL_FOCUS_TIMEOUT = 3.0      # if the web panel stops sending focus heartbeats for this long
+                               # (tab/browser closed), treat it as "not focused" so the floating
+                               # preview appears rather than staying hidden forever
+
 BUILTIN_TYPE = {
     "swipe_left": TRAJECTORY, "swipe_right": TRAJECTORY,
     "thumbs_up": POSE, "gun_point": POSE, "peace_sign": POSE,
-    "open_palm_hold": POSE, "closed_fist_hold": POSE,
+    "closed_fist_hold": POSE,
 }
 
 
@@ -122,6 +135,13 @@ class App:
         # and a real contributor to the FPS drop during recording sessions.
         self._report_cache = ""
         self._report_version = -1
+
+        self.show_preview = not args.no_preview
+        self._preview_visible = False       # whether the native window is currently shown
+        self._preview_topmost_check_at = 0.0
+        self.preview_pinned = False         # web toggle: force always-on-top regardless of focus
+        self.panel_focused = True           # updated by the web panel's focus/blur heartbeat
+        self._panel_focus_seen = time.time()
 
         self.profile = bool(getattr(args, "profile", False))
         self._prof_acc: dict = {}
@@ -201,6 +221,7 @@ class App:
         if self.cap:
             self.cap.release()
         self.tracker.close()
+        cv2.destroyAllWindows()
 
     # ==================================================================
     # main loop
@@ -280,7 +301,7 @@ class App:
                 t4 = time.perf_counter()
                 self.tick_fps()
                 self.annotate(frame, hand, status)
-                self.publish_frame(frame)
+                self.show_frame(frame)
                 self.publish_status()
                 t5 = time.perf_counter()
 
@@ -319,6 +340,11 @@ class App:
                     self.reset_counters()
                 elif t == "reload_config":
                     self.reload_config()
+                elif t == "set_panel_focus":
+                    self.panel_focused = bool(cmd.get("value"))
+                    self._panel_focus_seen = time.time()
+                elif t == "set_preview_pinned":
+                    self.preview_pinned = bool(cmd.get("value"))
             except Exception as exc:                  # noqa: BLE001
                 print("[command] {} failed: {}".format(t, exc))
 
@@ -672,12 +698,116 @@ class App:
             "gestures": self.gesture_rows(),
             "bindings": self.bindings.all(),
             "distance_report": rep,
+            "preview_pinned": self.preview_pinned,
+            "preview_visible": self._preview_visible,
+            "recent_events": self.recent_event_rows(),
         })
 
-    def publish_frame(self, frame) -> None:
-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-        if ok:
-            self.state.publish_frame(buf.tobytes())
+    def recent_event_rows(self, limit: int = 8) -> List[dict]:
+        """Last few fired/suppressed actions, newest first -- the main tab's
+        "live keystrokes" feed. Reuses ActionMapper.history rather than
+        keeping a second parallel log."""
+        rows = []
+        for ev in self.mapper.history[-limit:]:
+            rows.append({
+                "gesture": ev.gesture, "source": ev.source, "fired": ev.fired,
+                "detail": ev.detail, "t": ev.timestamp,
+            })
+        rows.reverse()
+        return rows
+
+    def _panel_effectively_focused(self) -> bool:
+        """Fall back to "not focused" if the web panel's heartbeat has gone
+        stale (tab/browser closed without firing a blur event) -- otherwise
+        the floating preview would stay hidden forever."""
+        if time.time() - self._panel_focus_seen > PANEL_FOCUS_TIMEOUT:
+            return False
+        return self.panel_focused
+
+    def _want_preview_visible(self) -> bool:
+        """Headless by default while the browser panel has focus -- no window,
+        no imshow, no per-frame draw cost. The floating preview appears on its
+        own the moment that's no longer true (switched to PowerPoint, closed
+        the tab, ...), can be forced on regardless via the web panel's pin
+        toggle, and is always shown during recording since that's the only
+        visual feedback the user has for where their hand is."""
+        if not self.show_preview:
+            return False
+        if self.recording:
+            return True
+        if self.preview_pinned:
+            return True
+        return not self._panel_effectively_focused()
+
+    def show_frame(self, frame) -> None:
+        """Local-only floating preview window. Deliberately binds no keys --
+        gesture control still goes exclusively through the web panel."""
+        want = self._want_preview_visible()
+        if not want:
+            if self._preview_visible:
+                self._destroy_preview_window()
+            return
+
+        if not self._preview_visible:
+            self._create_preview_window(frame)
+
+        cv2.imshow(PREVIEW_WINDOW, frame)
+        cv2.waitKey(1)
+        try:
+            if cv2.getWindowProperty(PREVIEW_WINDOW, cv2.WND_PROP_VISIBLE) < 1:
+                self._preview_visible = False   # user closed the window
+                return
+        except cv2.error:
+            self._preview_visible = False
+            return
+        self._reassert_preview_topmost()
+
+    def _create_preview_window(self, frame) -> None:
+        """WINDOW_NORMAL (resizable) + cv2.resizeWindow, not a forced win32
+        SetWindowPos size -- resizeWindow sets the *client* area directly, so
+        the video is never clipped by title-bar/border chrome (the old
+        "small but cropped" bug), and the user can freely drag-resize
+        afterward with cv2 rescaling the frame to fit, no re-cropping."""
+        h, w = frame.shape[:2]
+        target_h = max(1, round(PREVIEW_TARGET_WIDTH * h / max(w, 1)))
+        cv2.namedWindow(PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(PREVIEW_WINDOW, PREVIEW_TARGET_WIDTH, target_h)
+        self._preview_visible = True
+        self._preview_topmost_check_at = 0.0   # force an immediate placement below
+        self._place_preview_window()
+
+    def _destroy_preview_window(self) -> None:
+        self._preview_visible = False
+        try:
+            cv2.destroyWindow(PREVIEW_WINDOW)
+        except cv2.error:
+            pass
+
+    def _place_preview_window(self) -> None:
+        """One-time bottom-left placement on whatever monitor the user is
+        currently looking at -- only called right after the window is
+        (re)created, never on every frame, so a manual drag/resize afterward
+        sticks (the "don't keep it fixed" ask)."""
+        hwnd = window_utils.find_window_by_title(PREVIEW_WINDOW)
+        if hwnd is None:
+            return
+        active_mon = window_utils.monitor_for_window(window_utils.foreground_window())
+        mon = active_mon or window_utils.monitor_for_window(hwnd)
+        if mon is not None:
+            window_utils.pin_bottom_left(hwnd, mon, PREVIEW_MARGIN)
+        else:
+            window_utils.set_topmost(hwnd)
+
+    def _reassert_preview_topmost(self) -> None:
+        """Keep the always-on-top flag from being knocked off by some other
+        topmost window -- position/size are never touched here."""
+        now = time.time()
+        if now < self._preview_topmost_check_at:
+            return
+        self._preview_topmost_check_at = now + PREVIEW_TOPMOST_RECHECK_SECONDS
+        hwnd = window_utils.find_window_by_title(PREVIEW_WINDOW)
+        if hwnd is not None:
+            window_utils.set_topmost(hwnd)
 
     def log_frame(self, hand, status) -> None:
         pr = self.pose.last_result
@@ -797,6 +927,8 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=None, help="override web.port")
     ap.add_argument("--no-browser", action="store_true",
                     help="don't auto-open the control panel in a browser")
+    ap.add_argument("--no-preview", action="store_true",
+                    help="don't open the native camera preview window")
     ap.add_argument("--profile", action="store_true",
                     help="print per-stage timing breakdown once per second")
     args = ap.parse_args()

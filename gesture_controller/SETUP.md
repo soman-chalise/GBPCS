@@ -188,8 +188,11 @@ permanently, instead of passing `--camera` every time.
 
 A network stream pushes frames faster than the app consumes them; a
 background thread (`core/frame_source.py`) drains it continuously and keeps
-only the newest frame so latency doesn't grow unbounded — this is automatic,
-nothing to configure.
+only the newest frame so latency doesn't grow unbounded. That thread is
+controlled by `camera.threaded_stream` in `thresholds.yaml`, which defaults
+to `true` — correct here, and for the Jetson/4K-camera deployment rig.
+Section 9 covers the one case where you'd want it `false` instead (a local
+dev laptop whose USB/built-in webcam driver won't grant hardware MJPG).
 
 ---
 
@@ -254,7 +257,51 @@ Control Block Details").
 
 ---
 
-## 9. Data that persists between runs
+## 9. Troubleshooting: hand detection feels slow / a couple seconds behind
+
+If this happens **throughout the whole session**, not just at startup, and
+per-frame processing feels fine in isolation, this is almost always the
+camera capture thread fighting MediaPipe for CPU, not a lighting or model
+problem. Look for this line at startup:
+
+```
+[camera] WARNING: driver did not grant MJPG (got '...'). The wire format is
+likely uncompressed and may saturate USB bandwidth...
+```
+
+If you see it: your webcam's driver isn't giving the app hardware-compressed
+frames, so `core/frame_source.py`'s background camera-reading thread has to
+do real CPU work decoding raw frames every read — and with
+`camera.threaded_stream: true`, that competes directly with MediaPipe
+inference on the main thread for CPU, instead of overlapping idle I/O wait
+the way the threaded design assumes. Measured on real hardware hitting this:
+effective fps roughly **halved** (28fps → 13fps) and per-frame recognizer
+latency went from a consistent ~16ms to averaging 63ms with spikes past
+250ms, with threading on vs off.
+
+`camera.threaded_stream` in `thresholds.yaml` defaults to `true` — correct
+for a network stream (section 6) and for a proper deployment camera (e.g. the
+Jetson/4K rig), where it only helps. If you hit this on a **local dev
+laptop** with a USB/built-in webcam, set it to `false` **there** (don't
+change the shared default other people/rigs rely on) and re-test. If the
+slowness persists with it `false` too, try a lower `camera.width`/`height`,
+and see `tools/camera_check.py` (section 7) to rule out a camera-layer issue
+underneath it.
+
+This matters most if you're deploying somewhere with harder detection
+conditions to begin with (e.g. dim auditorium lighting) — a starved,
+sub-20fps pipeline stretches every frame-count threshold in
+`thresholds.yaml` (`hold_frames`, `motion_start_frames`,
+`hand_lost_grace_frames`, ...) proportionally longer in wall-clock time on
+top of whatever the lighting itself costs you, so fix this first and
+re-measure before concluding a detection problem is a lighting problem. A
+dev laptop with a flaky webcam driver is not a reliable stand-in for the
+actual deployment rig on this axis — validate the auditorium claim on the
+Jetson + 4K camera itself, not just on the laptop.
+
+---
+
+## 10. Data that persists between runs
 
 | file | what |
 |---|---|
@@ -269,7 +316,7 @@ automatically (bindings re-seed to the defaults in
 
 ---
 
-## 10. Future: Jetson Orin / Bluetooth HID (not built yet)
+## 11. Future: Jetson Orin / Bluetooth HID (not built yet)
 
 The eventual target is a headless NVIDIA Jetson Orin with the camera
 attached to it, connecting to the presentation laptop over Bluetooth as a

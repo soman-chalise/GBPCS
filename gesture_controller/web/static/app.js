@@ -3,6 +3,9 @@
 
   let controlOptions = [];
   let recording = false;
+  let lastGesturesKey = null;
+  let dropdownOpen = false;
+  let lastEventsKey = null;
 
   function api(path, opts) {
     return fetch(path, opts).then((r) => r.json());
@@ -73,7 +76,15 @@
         if (g.name === currentGesture) opt.selected = true;
         select.appendChild(opt);
       }
+      select.addEventListener("focus", () => { dropdownOpen = true; });
+      select.addEventListener("blur", () => { dropdownOpen = false; });
       select.addEventListener("change", () => {
+        // The native option list is already closed once "change" fires (the
+        // user has committed a choice) -- safe to let the next poll rebuild
+        // right away, which is what makes a reassignment (stealing this
+        // gesture from whatever control had it) show up on the OTHER
+        // control's dropdown immediately instead of only after it loses focus.
+        dropdownOpen = false;
         const newGesture = select.value;
         if (currentGesture && currentGesture !== newGesture) {
           post("/api/bindings", { gesture: currentGesture, control: "none" });
@@ -90,6 +101,43 @@
       tr.appendChild(tdGesture);
       tbody.appendChild(tr);
     }
+  }
+
+  function renderEventFeed(status) {
+    const rows = status.recent_events || [];
+    const key = JSON.stringify(rows);
+    if (key === lastEventsKey) return;
+    lastEventsKey = key;
+
+    const ul = document.getElementById("event-feed");
+    ul.innerHTML = "";
+    if (!rows.length) {
+      const li = document.createElement("li");
+      li.className = "feed-empty";
+      li.textContent = "no events yet";
+      ul.appendChild(li);
+      return;
+    }
+    for (const ev of rows) {
+      const li = document.createElement("li");
+      li.className = ev.fired ? "fired" : "suppressed";
+      const label = document.createElement("span");
+      label.textContent = ev.gesture + " -- " + ev.detail;
+      const tag = document.createElement("span");
+      tag.className = "tag";
+      tag.textContent = ev.fired ? ev.source : "skipped";
+      li.appendChild(label);
+      li.appendChild(tag);
+      ul.appendChild(li);
+    }
+  }
+
+  function renderPreview(status) {
+    const chk = document.getElementById("chk-pin");
+    if (document.activeElement !== chk) chk.checked = !!status.preview_pinned;
+    document.getElementById("preview-hint").textContent = status.preview_visible
+      ? "floating preview: visible right now"
+      : "floating preview: hidden right now (panel has focus)";
   }
 
   function renderStatus(status) {
@@ -139,8 +187,21 @@
       hint.textContent = "";
     }
 
-    renderControls(status);
-    renderGestures(status);
+    // Rebuilding these tables tears down and recreates every <select>, which
+    // was closing an open dropdown's native option list out from under the
+    // user on every 400ms poll tick -- even when nothing had changed. Skip
+    // the rebuild while a dropdown is actually open, and skip it entirely
+    // when the underlying data hasn't changed (also removes needless DOM
+    // churn on every tick).
+    const gesturesKey = JSON.stringify(status.gestures || []);
+    if (gesturesKey !== lastGesturesKey && !dropdownOpen) {
+      renderControls(status);
+      renderGestures(status);
+      lastGesturesKey = gesturesKey;
+    }
+
+    renderEventFeed(status);
+    renderPreview(status);
   }
 
   function poll() {
@@ -172,6 +233,39 @@
   });
 
   document.getElementById("btn-cancel").addEventListener("click", () => post("/api/record/cancel").then(poll));
+
+  document.getElementById("chk-pin").addEventListener("change", (e) => {
+    post("/api/preview/pin", { value: e.target.checked }).then(poll);
+  });
+
+  // -- tabs -------------------------------------------------------------
+  // Plain show/hide, no routing -- keeps the Record and Gestures pages from
+  // ever needing to scroll past each other, and each renders independently
+  // of which one is currently visible (they all just read the same status).
+  for (const btn of document.querySelectorAll(".tab")) {
+    btn.addEventListener("click", () => {
+      for (const b of document.querySelectorAll(".tab")) b.classList.remove("active");
+      for (const p of document.querySelectorAll(".tab-panel")) p.classList.remove("active");
+      btn.classList.add("active");
+      document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
+    });
+  }
+
+  // -- panel focus heartbeat --------------------------------------------
+  // Tells app.py whether this page currently has the user's attention, so it
+  // knows whether to keep the floating camera preview hidden (panel focused)
+  // or show it always-on-top (panel not focused, e.g. switched to slides).
+  // Events cover the common cases; the interval is just a safety net against
+  // a missed event (e.g. a browser that doesn't fire blur reliably).
+  function sendFocus() {
+    const focused = document.hasFocus() && document.visibilityState === "visible";
+    post("/api/panel_focus", { focused: focused }).catch(() => {});
+  }
+  window.addEventListener("focus", sendFocus);
+  window.addEventListener("blur", sendFocus);
+  document.addEventListener("visibilitychange", sendFocus);
+  setInterval(sendFocus, 1000);
+  sendFocus();
 
   api("/api/controls").then((data) => {
     controlOptions = data;

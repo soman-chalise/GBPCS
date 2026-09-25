@@ -72,6 +72,7 @@ class PoseRecognizer:
         self.hold_frames = int(p["hold_frames"])
         self.suppress_above_speed = float(p["suppress_above_speed"])
         self.trim_ratio = float(p["record_trim_ratio"])
+        self.hand_lost_grace = int(p["hand_lost_grace_frames"])
         self.store = store
 
         self._thresholds: Dict[str, float] = {}
@@ -83,6 +84,7 @@ class PoseRecognizer:
         self._candidate_run = 0
         self._stable: Optional[str] = None
         self._last_result: Optional[PoseResult] = None
+        self._absent_run = 0
 
         self.recalibrate()
 
@@ -99,6 +101,7 @@ class PoseRecognizer:
         self._candidate = None
         self._candidate_run = 0
         self._stable = None
+        self._absent_run = 0
 
     # -- feature -----------------------------------------------------------
     def feature_from_curls(self, curls: np.ndarray) -> np.ndarray:
@@ -217,11 +220,22 @@ class PoseRecognizer:
         exactly what PRD validation test 3 checks.
         """
         if curls is None:
-            # Hand gone: drop the stable pose so re-appearing re-triggers.
-            self._candidate, self._candidate_run, self._stable = None, 0, None
+            # Tolerate a short tracking dropout (MediaPipe flickers
+            # present/absent for a single frame often enough that treating
+            # every blip as "hand gone" wiped hold-progress and the stable
+            # pose before a held thumbs_up/fist could ever fire -- see
+            # thresholds.yaml's hand_lost_grace_frames note). Only past the
+            # grace window do we actually drop the stable pose so a
+            # re-appearing hand re-triggers.
+            self._absent_run += 1
             self._last_result = None
+            if self._absent_run <= self.hand_lost_grace:
+                self._candidate, self._candidate_run = None, 0
+                return None
+            self._candidate, self._candidate_run, self._stable = None, 0, None
             return None
 
+        self._absent_run = 0
         result = self.classify(curls)
         self._last_result = result
 

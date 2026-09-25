@@ -8,6 +8,9 @@ No recognizer -- built-in or custom -- knows a keystroke exists. Each emits a
 gesture NAME; this module resolves that name through `BindingsStore` to a
 control, then `controls.py` to an effect. Rebinding a gesture in the web UI
 never touches recognizer code.
+
+Keystrokes go to whatever window currently has OS focus -- the active-window
+strategy. There is no attempt to steal focus onto a specific target window.
 """
 
 from __future__ import annotations

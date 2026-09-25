@@ -1,23 +1,35 @@
 """Camera frame source -- device index or network stream.
 
-The interesting part is `threaded`. A USB camera's `read()` blocks on hardware,
-so it can never run ahead of us -- but that block (a driver-level USB
-transfer, milliseconds to tens of milliseconds depending on wire format) is
-CPU-idle time. Pumping it on its own thread lets that wait overlap with
-MediaPipe inference on the main thread instead of the two being paid for back
-to back every frame -- often the single biggest lever on effective FPS, since
-capture and inference are independent resources (USB I/O vs CPU). A network
-stream (a phone camera app) has the same treatment for a different reason: it
-pushes frames into a queue as fast as it likes, and every frame we fail to
-consume becomes permanent latency. `CAP_PROP_BUFFERSIZE` is documented to
-bound that queue but is a no-op on the FFMPEG backend used for http://
-sources, so it cannot be relied on.
+The interesting part is `threaded`, and it is a genuine tradeoff, not a free
+win -- measure before assuming it helps.
 
-The fix in both cases is to drain continuously on a background thread and keep
-only the most recent frame. The main loop then always gets the newest image,
-and surplus frames are dropped instead of queued. This is also what makes a
-processing FPS cap safe: without draining, consuming slower than the stream
-produces just grows the backlog.
+THE THEORY: a USB camera's `read()` blocks on hardware, so it can never run
+ahead of us -- but that block (a driver-level USB transfer, milliseconds to
+tens of milliseconds depending on wire format) is supposed to be CPU-idle
+time. Pumping it on its own thread would let that wait overlap with MediaPipe
+inference on the main thread instead of the two being paid for back to back
+every frame. A network stream (a phone camera app) has a second, independent
+reason to want this: it pushes frames into a queue as fast as it likes, and
+every frame we fail to consume becomes permanent latency. `CAP_PROP_BUFFERSIZE`
+is documented to bound that queue but is a no-op on the FFMPEG backend used
+for http:// sources, so draining on a thread and keeping only the newest frame
+is the only reliable fix there.
+
+THE CATCH, measured on real hardware: that CPU-idle assumption only holds if
+the driver actually grants hardware MJPG compression (see `configure()`'s
+warning below). When it doesn't -- common on cheap/built-in webcams, not
+expected on a proper deployment camera -- the "blocking" read is doing real
+CPU work decoding the raw wire format, not idling, so the pump thread
+directly competes with MediaPipe inference on the main thread for CPU
+instead of overlapping it. On one affected dev laptop this measured >2x
+WORSE effective fps and wildly spikier per-frame latency with threading on
+vs off.
+
+`camera.threaded_stream` in thresholds.yaml defaults to `true` -- correct for
+a network stream (the queue-growth problem is real there and threading is
+the only fix) and for the target deployment rig. If you hit the MJPG warning
+on a local dev machine, flip it to `false` there rather than changing the
+shared default -- see SETUP.md section 9.
 """
 
 from __future__ import annotations

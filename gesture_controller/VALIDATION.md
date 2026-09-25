@@ -128,8 +128,8 @@ it does not, you did not actually test three speeds.
 ## Test 3 — Poses, held and quick, with no hand motion
 
 Confirms the pose recognizer needs no trajectory at all. Applies to both
-built-in poses (`thumbs_up`, `gun_point`, `peace_sign`, `open_palm_hold`,
-`closed_fist_hold`) and any custom pose gestures you've recorded.
+built-in poses (`thumbs_up`, `gun_point`, `peace_sign`, `closed_fist_hold`)
+and any custom pose gestures you've recorded.
 
 **Run** (same session is fine; click **Reset stats** in the web panel first)
 

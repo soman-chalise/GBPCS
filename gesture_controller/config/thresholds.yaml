@@ -27,8 +27,25 @@ camera:
   fps: 30
   # Network streams (a phone camera) queue frames faster than we consume them,
   # so latency grows without bound. With this on, a background thread keeps
-  # only the NEWEST frame and drops the backlog. Ignored for USB devices,
-  # whose read() blocks on hardware and cannot run ahead.
+  # only the NEWEST frame and drops the backlog. Also the right default for
+  # the target deployment rig (Jetson Orin + 4K camera) -- leave this true
+  # there and for any stream URL in camera.source.
+  #
+  # PER-MACHINE CAVEAT, measured on one dev laptop: if a local USB/built-in
+  # webcam's driver won't grant hardware MJPG compression (watch for
+  # `[camera] WARNING: driver did not grant MJPG` at startup -- common on
+  # cheap/built-in webcams, NOT expected on the Jetson rig's camera), the
+  # pump thread has to do real per-frame CPU work decoding the raw wire
+  # format, and that competes with MediaPipe for CPU instead of overlapping
+  # idle I/O wait the way the threaded design assumes. On the affected
+  # laptop this cost ~14fps effective (recognizer `process()` averaging
+  # 63ms, spiking past 250ms) with threading on, vs ~28fps (averaging 16ms)
+  # with it off -- a >2x difference, and the direct cause of hand detection
+  # feeling multiple seconds behind, since every frame-count threshold below
+  # (hold_frames, motion_start_frames, etc.) takes proportionally longer in
+  # wall-clock time at a lower real fps. If you hit that warning on your own
+  # machine, flip this to false locally rather than changing the shared
+  # default -- see SETUP.md section 9.
   threaded_stream: true
   # Cap how often we PROCESS frames. 0 = uncapped (run as fast as the camera).
   # Only meaningful together with threaded_stream, which absorbs the surplus;
@@ -38,7 +55,11 @@ camera:
   flip_horizontal: true        # mirror view, so moving your hand right moves it right on screen
 
 tracker:
-  model_path: models/hand_landmarker.task
+  # GestureRecognizer, not plain HandLandmarker -- it runs hand detection
+  # internally (still the same 21-landmark output) AND ships a pretrained
+  # static-gesture classifier used by [builtin] below. One model, one
+  # inference per frame. See core/hand_tracker.py's module docstring.
+  model_path: models/gesture_recognizer.task
   num_hands: 1                  # PRD 4.1 -- single hand only for v1
   # Lowered from 0.5 after a real session showed 8/11 segments closing on
   # hand_lost: the room measured 71/255 brightness and 80 Laplacian sharpness,
@@ -98,19 +119,31 @@ pose:
                                 # Set very high (e.g. 99) to disable for validation test 3.
   record_trim_ratio: 0.2        # when recording a pose, drop this fraction off each end
                                 # of the capture and average the stable middle
+  hand_lost_grace_frames: 4     # tolerate this many consecutive no-hand frames without wiping
+                                # hold-progress/the stable pose -- MediaPipe flickers present/
+                                # absent for a single frame often enough (see logs/frames.csv)
+                                # that treating every flicker as "hand gone" made a held
+                                # thumbs_up/fist have to re-accumulate hold_frames from zero,
+                                # and re-fire, on every blip. Beyond this many frames in a row,
+                                # still treat the hand as genuinely gone.
 
 builtin:
-  # Rule-based gestures that ship pre-tuned and need zero recording (see
-  # core/builtin_gestures.py). Separate from [pose]/[trajectory], which are
-  # the calibrated thresholds for a user's own recorded gestures.
-  finger_extended: 0.85     # curl ratio above this = extended (index/middle/ring/pinky)
-  finger_curled: 0.55       # curl ratio below this = curled
-  thumb_extended: 0.65      # thumb geometry differs from the other four fingers
-  thumb_curled: 0.45
-  thumb_up_y_margin: 0.35   # thumb tip must be this far above the wrist (hand-widths) for thumbs_up
+  # thumbs_up / closed_fist_hold / peace_sign are read straight off
+  # GestureRecognizer's pretrained classifier (Thumb_Up / Closed_Fist /
+  # Victory) -- see core/hand_tracker.py and core/builtin_gestures.py. Only
+  # gun_point has no pretrained equivalent and stays a geometric rule on raw
+  # landmarks, using the constants below. Separate from [pose]/[trajectory],
+  # which are the calibrated thresholds for a user's own recorded gestures.
+  gesture_min_confidence: 0.6  # score_threshold on the pretrained classifier; below this the
+                                # model's top-1 is treated as "no gesture" (same as its own "None")
+  finger_extended: 0.88     # curl ratio above this = extended; gun_point only
+  finger_curled: 0.50       # curl ratio below this = curled; gun_point only
+  thumb_extended: 0.65      # thumb geometry differs from the other four fingers; gun_point only
   gun_point_z_margin: 0.05  # index tip must be this much closer to camera (relative z) for gun_point
-  hold_frames: 5            # frames a built-in pose must be stable before it fires
+  hold_frames: 8            # frames a built-in pose must be stable before it fires
   suppress_above_speed: 0.20   # ignore pose transitions while the wrist is moving this fast
+  hand_lost_grace_frames: 4    # tolerate this many consecutive no-hand frames without wiping
+                                # hold-progress/the stable pose -- see [pose]'s note on why.
   swipe_min_path_length: 0.55  # total path in hand-widths; kills jitter-sized "swipes"
   swipe_straightness_min: 0.6  # net displacement / path length; rejects wavy/curved motions
   swipe_axis_dominance: 1.5    # |dx| must be this many times |dy| to call a swipe horizontal

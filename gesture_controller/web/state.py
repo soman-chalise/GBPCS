@@ -1,25 +1,29 @@
 """Thread-safe hand-off between the camera/recognition loop and Flask.
 
-The loop (running in the main thread, `app.py`) is the ONLY writer of status
-and video frames, and the ONLY consumer of commands. The Flask server (its
-own background thread) only ever publishes commands and reads snapshots. That
-keeps every actual state mutation -- toggling LIVE, rebinding a gesture,
-starting a recording -- on the loop thread, one frame later, so nothing in
-`App` needs its own extra locking.
+The loop (running in the main thread, `app.py`) is the ONLY writer of status,
+and the ONLY consumer of commands. The Flask server (its own background
+thread) only ever publishes commands and reads status snapshots. That keeps
+every actual state mutation -- toggling LIVE, rebinding a gesture, starting a
+recording -- on the loop thread, one frame later, so nothing in `App` needs
+its own extra locking.
+
+The camera preview itself is a local `cv2.imshow` window (see `App.show_frame`
+in app.py), not something the web layer serves -- this app never runs
+anywhere but the operator's own machine, so there is no browser/remote client
+to stream video to.
 """
 
 from __future__ import annotations
 
 import queue
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 class AppState:
     def __init__(self):
         self._lock = threading.Lock()
         self._status: Dict[str, Any] = {}
-        self._frame_jpeg: Optional[bytes] = None
         self._commands: "queue.Queue[dict]" = queue.Queue()
 
     # -- written by the loop, read by the web layer -------------------------
@@ -30,14 +34,6 @@ class AppState:
     def get_status(self) -> Dict[str, Any]:
         with self._lock:
             return dict(self._status)
-
-    def publish_frame(self, jpeg_bytes: bytes) -> None:
-        with self._lock:
-            self._frame_jpeg = jpeg_bytes
-
-    def get_frame(self) -> Optional[bytes]:
-        with self._lock:
-            return self._frame_jpeg
 
     # -- written by the web layer, read/drained by the loop ------------------
     def send_command(self, **cmd) -> None:

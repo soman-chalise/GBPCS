@@ -1,17 +1,19 @@
-"""Flask control panel -- status/control JSON API + MJPEG preview.
+"""Flask control panel -- status/control JSON API.
 
 Every mutating route only enqueues a command onto `AppState`; the camera loop
 in `app.py` is what actually applies it (see `web/state.py`). Every GET route
 reads the most recent snapshot the loop published. Binds to localhost only for
 now -- see prd.md's open item on the Jetson/Bluetooth HID port.
+
+The camera preview is a native `cv2.imshow` window (app.py), not served here --
+see web/state.py for why.
 """
 
 from __future__ import annotations
 
 import os
-import time
 
-from flask import Flask, Response, jsonify, request
+from flask import Flask, jsonify, request
 
 from core import controls as controls_mod
 
@@ -46,6 +48,22 @@ def create_app(state: AppState) -> Flask:
     def set_keystrokes():
         body = request.get_json(force=True, silent=True) or {}
         state.send_command(type="set_keystrokes", value=bool(body.get("value")))
+        return jsonify(ok=True)
+
+    @app.post("/api/panel_focus")
+    def panel_focus():
+        # A heartbeat from the page's focus/blur/visibilitychange handlers --
+        # drives whether the floating camera preview is currently hidden
+        # (panel focused) or shown always-on-top (panel not focused). See
+        # App._want_preview_visible in app.py.
+        body = request.get_json(force=True, silent=True) or {}
+        state.send_command(type="set_panel_focus", value=bool(body.get("focused")))
+        return jsonify(ok=True)
+
+    @app.post("/api/preview/pin")
+    def set_preview_pinned():
+        body = request.get_json(force=True, silent=True) or {}
+        state.send_command(type="set_preview_pinned", value=bool(body.get("value")))
         return jsonify(ok=True)
 
     @app.post("/api/bindings")
@@ -95,22 +113,5 @@ def create_app(state: AppState) -> Flask:
     def reload_config():
         state.send_command(type="reload_config")
         return jsonify(ok=True)
-
-    @app.get("/stream.mjpg")
-    def stream():
-        def gen():
-            boundary = b"--frame"
-            while True:
-                jpeg = state.get_frame()
-                if jpeg is not None:
-                    yield (
-                        boundary + b"\r\n"
-                        b"Content-Type: image/jpeg\r\n"
-                        b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
-                        + jpeg + b"\r\n"
-                    )
-                time.sleep(0.03)
-
-        return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
     return app

@@ -6,3 +6,4 @@ numpy==2.5.2
 pyautogui==0.9.54
 PyYAML==6.0.3
 Flask==3.1.0
+pywin32==308           # always-on-top preview window placement + monitor enumeration (Windows only)
